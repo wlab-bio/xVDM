@@ -1,5 +1,4 @@
 import threads_bootstrap
-from threads_bootstrap import NTHREADS
 import masterProcesses
 import sysOps
 import sys
@@ -8,7 +7,6 @@ import optimOps
 global globaldatapath
 global pipeline_command
 global num_workers
-import numpy as np
 import os
 os.environ.setdefault("LC_ALL", "C")
 os.environ.setdefault("LANG",  "C")

@@ -1,31 +1,12 @@
-"""clusterplot.py
+"""Segmentation helpers for xVDM/GSE outputs.
 
-Unifies point-cloud segmentation variants into a single module and now includes a scalable recursive sparsest-cut transport route:
+The production GSE route uses HDBSCAN on final coordinates and Infomap on a
+sparse final-coordinate diffusion-transport graph. Both routes can be curated
+with the raw adjacency graph and split by raw connected components.
 
-Version 1 ("hdbscan")
-    - HDBSCAN on point coordinates
-    - Iterative label curation (majority vote) using the *original* adjacency graph
-
-Version 2 ("infomap")
-    - Infomap flow modules on a *transformed transport* graph (transformed_matrix.npz)
-    - Optional minimum-cluster-size enforcement + iterative majority-vote curation
-      starting from the initial Infomap partition
-
-Version 3 ("transport sparsest-cut")
-    - Recursive spectral sparsest-cut segmentation on the transformed transport graph
-    - Optional adaptive Gaussian coordinate reweighting of edge weights before graph pruning
-
-The main entry point is :func:`execute_clusters_dual`, which returns an (N, 2) array:
-
-    labels[:, 0] -> hdbscan labels  (HDBSCAN + original-graph curation)
-    labels[:, 1] -> infomap labels  (Infomap + iterative transformed-graph curation)
-
-You can compute only one of the columns by setting ``which='hdbscan'`` or ``which='infomap'``;
-the non-computed column is filled with -1.
-
-This file is a merge/cleanup of the two user-provided scripts:
-    - clusterplot_hdbscan.py (HDBSCAN + curation)
-    - clusterplot_infomap.py (Infomap on transformed_matrix.npz)
+Experimental/back-compatibility helpers for transport-HDBSCAN, Leiden,
+sparsest-cut, and dual-wrapper calls are kept below, but they are not the
+cell-calling route used by ``optimOps.run_GSE()``.
 """
 
 from __future__ import annotations
@@ -115,9 +96,9 @@ def _remap_contiguous(labels: np.ndarray) -> np.ndarray:
 
 def _normalize_which(which: str) -> Literal["hdbscan", "infomap", "both"]:
     w = (which or "").strip().lower()
-    if w in {"hdbscan", "hdbscan", "orig", "original", "graph1", "method1", "1"}:
+    if w in {"hdbscan", "orig", "original", "graph1", "method1", "1"}:
         return "hdbscan"
-    if w in {"infomap", "infomap", "transport", "transformed", "graph2", "method2", "2"}:
+    if w in {"infomap", "transport", "transformed", "graph2", "method2", "2"}:
         return "infomap"
     if w in {"both", "all", "dual", "hdbscan+infomap", "infomap+hdbscan"}:
         return "both"
@@ -556,12 +537,15 @@ def _fit_hdbscan_sparse_precomputed_by_component(
         sk_min_samples_sub = min(sk_min_samples_global, size)
         row_counts_sub = np.diff(D_sub.indptr)
         min_row_count_sub = int(np.min(row_counts_sub)) if row_counts_sub.size > 0 else 0
+        if min_row_count_sub < 2:
+            continue
         if min_row_count_sub < int(sk_min_samples_sub):
-            raise ValueError(
-                f"({route_name}) connected transport component {comp_id} still has rows with fewer than "
-                f"{int(sk_min_samples_sub)} stored distances after preparation "
-                f"(min_row_count={min_row_count_sub})."
+            _status(
+                f"({route_name}) connected transport component {comp_id} only stores "
+                f"{min_row_count_sub} sparse distances per row at minimum; reducing effective "
+                f"min_samples from {int(sk_min_samples_sub) - 1} to {min_row_count_sub - 1}."
             )
+            sk_min_samples_sub = max(2, min_row_count_sub)
         max_distance_sub = float(np.max(D_sub.data)) if D_sub.data.size > 0 else 1.0
         if not np.isfinite(max_distance_sub) or max_distance_sub <= 0.0:
             max_distance_sub = 1.0
@@ -651,6 +635,98 @@ def execute_clusters_hdbscan(
 
     labels = _remap_contiguous(labels)
     return labels
+
+
+def execute_clusters_hdbscan_transport(
+    min_cluster_size: int = _DEFAULT_MIN_CLUSTER_SIZE,
+    min_samples: int = _DEFAULT_HDBSCAN_MIN_SAMPLES,
+    transformed_matrix_path: Optional[str] = None,
+    k_per_row: Optional[int] = None,
+    weight_fraction_per_row: Optional[float] = None,
+    min_edges_per_row: int = 3,
+    curation_tol: float = 1e-4,
+    max_curation_iter: int = 50,
+    distance_eps: float = 1e-12,
+) -> np.ndarray:
+    """Run sparse-precomputed HDBSCAN directly on a transformed transport graph.
+
+    When ``k_per_row`` and ``weight_fraction_per_row`` are both left as ``None``,
+    the raw sparse ``transformed_matrix.npz`` is reused as the neighborhood graph.
+    This is the intended route for the earlier higher-dimensional transport matrix,
+    where the matrix itself already encodes the source kNN structure.
+    """
+    tm_path = _resolve_transformed_matrix_path(transformed_matrix_path)
+    _status(f"Loading transformed transport graph (hdbscan transport): {tm_path}")
+    T = load_npz(tm_path).tocsr()
+    n = int(T.shape[0])
+    _ensure_square(T)
+
+    T = T.maximum(T.T).tocsr()
+    T.setdiag(0)
+    T.eliminate_zeros()
+
+    if T.nnz == 0:
+        _status("(hdbscan transport) Transport graph is empty; returning all-noise labels.")
+        return np.full(n, -1, dtype=np.int32)
+
+    if weight_fraction_per_row is None and k_per_row is None:
+        P = T
+        _status(
+            "(hdbscan transport) Using raw transformed_matrix.npz as the sparse neighbor graph "
+            "for precomputed HDBSCAN distances."
+        )
+    else:
+        if k_per_row is None:
+            k = max(int(min_edges_per_row), int(min_samples) + 1)
+        else:
+            k = int(k_per_row)
+            if k < 1:
+                raise ValueError("k_per_row must be >= 1")
+
+        if weight_fraction_per_row is not None:
+            frac = float(weight_fraction_per_row)
+            if not (0.0 <= frac <= 1.0):
+                raise ValueError("weight_fraction_per_row must be in [0, 1].")
+            _status(
+                f"(hdbscan transport) Pruning transformed graph by per-row cumulative weight fraction={frac:.6g} "
+                f"with cap k_max={k} and min_edges_per_row={int(min_edges_per_row)}."
+            )
+            P = _prune_cumweight_csr(T, k_max=k, weight_fraction=frac, min_keep=int(min_edges_per_row))
+        else:
+            _status(f"(hdbscan transport) Pruning transformed graph to ~{k} strongest edges per node.")
+            P = _prune_topk_csr(T, k)
+
+        P = P.maximum(P.T).tocsr()
+        P.setdiag(0)
+        P.eliminate_zeros()
+
+    if P.nnz == 0:
+        _status("(hdbscan transport) Prepared transport graph is empty; returning all-noise labels.")
+        return np.full(n, -1, dtype=np.int32)
+
+    row_strength = np.asarray(P.sum(axis=1)).reshape(-1).astype(np.float64, copy=False)
+    D = _transport_similarity_to_distance_csr(P, row_strength, distance_eps=float(distance_eps))
+    D = _add_self_distance_diagonal(D, self_distance=max(float(distance_eps), 1e-12))
+
+    labels = _fit_hdbscan_sparse_precomputed_by_component(
+        D,
+        P,
+        min_cluster_size=int(min_cluster_size),
+        min_samples=int(min_samples),
+        route_name="hdbscan transport",
+    )
+
+    for it in range(int(max_curation_iter)):
+        revised = curate_labels_with_graph(labels, P)
+        modified_frac = float(np.mean(revised != labels))
+        _status(f"(hdbscan transport) Modified fraction on iteration {it} = {modified_frac:.6g}")
+        labels = revised
+        if modified_frac < float(curation_tol):
+            break
+
+    labels = _remap_contiguous(labels)
+    _status("HDBSCAN clustering complete (hdbscan transport).")
+    return labels.astype(np.int32, copy=False)
 
 
 # -----------------------------------------------------------------------------
@@ -809,22 +885,11 @@ def _write_link_list_upper_txt(
             np.savetxt(f, block, fmt=["%d", "%d", "%.12g"])
 
 
-"""Infomap graph pruning utilities
-
-The Infomap route operates on a (typically dense) transformed transport kernel.
-We must prune aggressively before writing a link-list for Infomap.
-
-Historically this pruning was done via *top-k per row*.
-
-This patch adds an optional *per-row cumulative weight fraction* policy.
-
-Given a row i with weights w_ij and total row mass W_i = sum_j w_ij,
-we keep the strongest incident edges until their cumulative mass reaches
-
-    sum_{j in kept(i)} w_ij  >=  frac * W_i
-
-subject to a per-row cap (k_max) to keep runtime and output size bounded.
-"""
+# Infomap graph pruning utilities. The production Infomap route prunes the
+# transformed transport graph before writing a weighted link-list. The default
+# policy is top-k per row; an optional cumulative-weight policy keeps the
+# strongest row entries until their mass reaches a requested fraction, subject
+# to a row cap and minimum edge count.
 
 # ---- scalable pruning kernels (numba) ----
 
@@ -1205,6 +1270,122 @@ def execute_clusters_infomap(
 
     _status("Infomap clustering complete (infomap).")
     return labels
+
+
+def execute_clusters_leiden(
+    min_cluster_size: int = _DEFAULT_MIN_CLUSTER_SIZE,
+    transformed_matrix_path: Optional[str] = None,
+    seed: int = 1,
+    k_per_row: Optional[int] = None,
+    weight_fraction_per_row: Optional[float] = None,
+    min_edges_per_row: int = 3,
+    protect_lcc: bool = True,
+    curation_tol: float = 1e-4,
+    max_curation_iter: int = 50,
+    leiden_resolution: float = 1.0,
+    partition_type: str = "rb",
+) -> np.ndarray:
+    """Run Leiden on the same transformed transport graph used for final Infomap.
+
+    The graph-loading and pruning path intentionally mirrors
+    :func:`execute_clusters_infomap`, but omits the Infomap-specific diagonal
+    slack/self-loop trick before partitioning.  Small clusters are converted to
+    noise (-1) and then majority-vote curated on the pruned transport graph,
+    matching the existing Infomap post-processing flow.
+    """
+    try:
+        import igraph as ig  # type: ignore
+        import leidenalg as la  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Leiden clustering requires python-igraph and leidenalg to be installed."
+        ) from e
+
+    tm_path = _resolve_transformed_matrix_path(transformed_matrix_path)
+    _status(f"Loading transformed transport graph (leiden): {tm_path}")
+    T = load_npz(tm_path).tocsr()
+    n = int(T.shape[0])
+    _ensure_square(T)
+
+    T.setdiag(0)
+    T.eliminate_zeros()
+
+    if bool(protect_lcc):
+        _status("(leiden) Detecting largest connected component (pre-prune).")
+        _ = _largest_connected_component_mask(T)
+
+    if k_per_row is None:
+        k = 10
+    else:
+        k = int(k_per_row)
+        if k < 1:
+            raise ValueError("k_per_row must be >= 1")
+
+    if weight_fraction_per_row is not None:
+        frac = float(weight_fraction_per_row)
+        if not (0.0 <= frac <= 1.0):
+            raise ValueError("weight_fraction_per_row must be in [0, 1].")
+        _status(
+            f"(leiden) Pruning transformed graph by per-row cumulative weight fraction={frac:.6g} "
+            f"with cap k_max={k} and min_edges_per_row={int(min_edges_per_row)}."
+        )
+        P = _prune_cumweight_csr(T, k_max=k, weight_fraction=frac, min_keep=int(min_edges_per_row))
+    else:
+        _status(f"(leiden) Pruning transformed graph to ~{k} strongest edges per node.")
+        P = _prune_topk_csr(T, k)
+
+    P = P.maximum(P.T).tocsr()
+    P.setdiag(0)
+    P.eliminate_zeros()
+
+    if P.nnz == 0:
+        _status("(leiden) Pruned graph is empty; returning singleton labels.")
+        labels = np.arange(n, dtype=np.int32)
+    else:
+        edge_coo = triu(P, k=1).tocoo()
+        edges = list(zip(edge_coo.row.tolist(), edge_coo.col.tolist()))
+        weights = edge_coo.data.astype(float).tolist()
+
+        graph = ig.Graph(n=n, edges=edges, directed=False)
+        graph.es["weight"] = weights
+
+        part_key = str(partition_type).strip().lower()
+        if part_key == "cpm":
+            partition_cls = la.CPMVertexPartition
+        elif part_key in {"rb", "rbconfiguration", "modularity"}:
+            partition_cls = la.RBConfigurationVertexPartition
+        else:
+            raise ValueError("partition_type must be one of {'rb', 'cpm'}")
+
+        partition = la.find_partition(
+            graph,
+            partition_cls,
+            weights="weight",
+            seed=int(seed),
+            resolution_parameter=float(leiden_resolution),
+        )
+        labels = np.asarray(partition.membership, dtype=np.int32)
+
+    if min_cluster_size is not None and int(min_cluster_size) > 1:
+        valid = labels >= 0
+        if np.any(valid):
+            sizes = np.bincount(labels[valid])
+            small = np.where(sizes < int(min_cluster_size))[0]
+            if small.size > 0:
+                labels = labels.copy()
+                labels[np.isin(labels, small)] = -1
+
+    for it in range(int(max_curation_iter)):
+        revised = curate_labels_with_graph(labels, P)
+        modified_frac = float(np.mean(revised != labels))
+        _status(f"(leiden) Modified fraction on iteration {it} = {modified_frac:.6g}")
+        labels = revised
+        if modified_frac < float(curation_tol):
+            break
+
+    labels = _remap_contiguous(labels)
+    _status("Leiden clustering complete (leiden).")
+    return labels.astype(np.int32, copy=False)
 
 
 # -----------------------------------------------------------------------------

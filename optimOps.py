@@ -5,32 +5,88 @@ import scipy
 from annoy import AnnoyIndex
 import sysOps
 import os
+import shutil
 import faiss
 import pymetis
 from numpy import linalg as LA
-from scipy.sparse.linalg import ArpackNoConvergence, ArpackError  # eigsh unused (krylov solver below)
+from numpy.random import default_rng
+from scipy.sparse.linalg import ArpackNoConvergence, ArpackError
 from scipy.sparse import csr_matrix, save_npz, load_npz
 from scipy.optimize import minimize
 from sklearn.neighbors import NearestNeighbors
-from numba import jit, njit, types, prange, float64, int64
+from numba import njit, prange
 import json
+import hashlib
+import tempfile
 from joblib import Parallel, delayed
 import pandas as pd
-from threading import Lock
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import math
 from scipy.sparse.csgraph import connected_components
+from contextlib import contextmanager
+
+try:
+    from threadpoolctl import threadpool_limits
+except Exception:  # pragma: no cover
+    @contextmanager
+    def threadpool_limits(limits=None):
+        yield
 
 # Final post-embedding clustering layout/version.
 _FINAL_CLUSTER_LABELS_LAYOUT_VERSION = 2
-_FINAL_CLUSTER_MIN_CLUSTER_SIZE = 100
+_FINAL_CLUSTER_MIN_CLUSTER_SIZE = 50
 _FINAL_HDBSCAN_MIN_SAMPLES = 50
 
-_FILTER_EDGE_ZSCORE = 6.0
-_FILTER_DISTANCE_CHUNK = 2_000_000
+# Shared Infomap transport-graph pruning policy used by final post-embedding
+# clustering and by the final coarsening/alignment stage.
+_INFOMAP_K_PER_ROW = 10
+_INFOMAP_WEIGHT_FRACTION_PER_ROW = 0.90
+_INFOMAP_MIN_EDGES_PER_ROW = 3
+_INFOMAP_NUM_TRIALS = 5
+
+# Infomap policy for final post-GSEoutput clustering.
+_FINAL_INFOMAP_ENFORCE_MIN_CLUSTER_SIZE = True
+_FINAL_INFOMAP_MARKOV_TIME = 2.0
+_FINAL_INFOMAP_PROTECT_LCC = True
+
+# Final coarsening/alignment layout.  Coarsen-and-align no longer changes the
+# pre-GSE or full_GSE route; it only builds this directory after GSEoutput.txt
+# and final Infomap clustering have been produced.
+_FINAL_COARSEN_DIRNAME = 'final_coarsening'
+_FINAL_COARSEN_COMPONENT_DIRNAME = 'component0'
+_FINAL_COARSEN_META_FILENAME = 'final_coarsening.meta.json'
+_FINAL_COARSEN_ALIGN_META_FILENAME = 'final_coarsen_alignment.meta.json'
+
+_COARSEN_ANNOTATION_BINARIZE_THRESHOLD = 2
+
+# register_zf public run choices parsed/written by fill_params():
+#   -register_zf, -slice_path, -register_zf_match_lam_dir,
+#   -register_zf_match_refine_iter, -register_zf_ensemble_size.
+# Ensemble process/thread counts are runtime controls set via
+# REGISTER_ZF_ENSEMBLE_N_JOBS / REGZF_ENSEMBLE_N_JOBS and
+# REGISTER_ZF_ENSEMBLE_THREADS_PER_WORKER / REGZF_ENSEMBLE_THREADS_PER_WORKER.
+# In coarsen-and-align mode register_zf is deferred until after final Infomap
+# clustering; it operates on the final-coarsened aggregate graph and leaves the
+# slice-to-node map in coarsened form.
+_REGISTER_ZF_MATCH_LAM_DIR = 2.0
+_REGISTER_ZF_MATCH_REFINE_ITER = 2
+_REGISTER_ZF_ENSEMBLE_SIZE = 16
+_REGISTER_ZF_ENSEMBLE_SEED = 0
+_REGISTER_ZF_ENSEMBLE_MODE = 'lexicographic'
+_REGISTER_ZF_ENSEMBLE_TIE_MAX = 1023
+_REGISTER_ZF_ENSEMBLE_PERTURB_UNITS = 0
+_REGISTER_ZF_ENSEMBLE_REL_TOL = 0.0
+_REGISTER_ZF_ENSEMBLE_ABS_TOL = 0.0
+_REGISTER_ZF_ENSEMBLE_THREADS_PER_WORKER = 1
+_REGISTER_ZF_NUM_POLE_PAIRS = 3
+_REGISTER_ZF_GENES_PER_POLE = 3
+_REGISTER_ZF_SLICE_CAPACITY_MODE = 'mass_exact'
+_REGISTER_ZF_MOMENT_COV_FLOOR = 1.0e-4
+_REGISTER_ZF_COARSE_MOMENTS_FILENAME = 'coarsen_align_coarse_node_mu_cov.npz'
+_REGISTER_ZF_COARSE_MOMENTS_META_FILENAME = 'coarsen_align_coarse_node_mu_cov.meta.json'
 
 
-def min_contig_edges(index_link_array, dataset_index_array, link_data, Nassoc):
+def min_contig_edges(index_link_array, dataset_index_array, link_data):
     # Function is used for single-linkage clustering of pts (to identify which sets are contiguous and which are not)
     # Inputs:
     #    1. index_link_array: indices for individual pts
@@ -64,6 +120,26 @@ def min_contig_edges(index_link_array, dataset_index_array, link_data, Nassoc):
 
     return
 
+
+def interleave_concat(arr1_fname, arr2_fname, out_fname, d):
+    arr1 = np.load(arr1_fname, mmap_mode='r')
+    arr2 = np.load(arr2_fname, mmap_mode='r')
+    n = arr1.shape[0]
+    c1, c2 = arr1.shape[1], arr2.shape[1]
+    b1, b2 = (c1 + d - 1) // d, (c2 + d - 1) // d
+    total_cols = c1 + c2
+    out = np.empty((n, total_cols), dtype=arr1.dtype)
+    col = 0
+    for i in range(max(b1, b2)):
+        if i < b1:
+            s, e = i * d, min((i + 1) * d, c1)
+            out[:, col:col + e - s] = arr1[:, s:e]
+            col += e - s
+        if i < b2:
+            s, e = i * d, min((i + 1) * d, c2)
+            out[:, col:col + e - s] = arr2[:, s:e]
+            col += e - s
+    np.save(out_fname, out)
 
 @njit(parallel=True)
 def parallel_dot(u, v):
@@ -155,50 +231,35 @@ def mgs_inplace_parallel(M):
             parallel_axpy(col_j, dot_ij, col_i)
 
 
-def _coarsen_param_is_enabled(value):
-    if isinstance(value, bool):
-        return bool(value)
-    if value is None:
-        return False
-    if isinstance(value, (list, tuple)):
-        if len(value) == 0:
-            return True
-        return any(v not in (None, "", False) for v in value)
-    if isinstance(value, str):
-        return value != ""
-    return True
-
-
-def _reject_removed_coarsen_params(params):
-    removed = sorted(
-        str(k)
-        for k, v in params.items()
-        if str(k).startswith('-coarsen') and _coarsen_param_is_enabled(v)
-    )
-    if removed:
-        raise ValueError(
-            "The coarsen/Infomap bootstrap pipeline has been removed. Unsupported parameters: "
-            + ", ".join(removed)
-        )
-
-
 def run_GSE(output_name, params, coarsen=True):
-    # `coarsen` is retained only for API compatibility; the coarsen/Infomap
-    # bootstrap route has been removed.
+    # `coarsen` is retained for API compatibility.  The coarsen-and-align
+    # route is now intentionally identical to the non-coarsen route through
+    # GSEoutput.txt; final coarsening/alignment runs only after final Infomap.
     if type(params['-inference_eignum']) == list:
         fill_params(params)
-    _reject_removed_coarsen_params(params)
+    else:
+        _drop_nonpublic_register_zf_params(params)
 
-    # When run_GSE() is called programmatically (already-parsed params), some legacy
-    # keys may be absent. Set minimal defaults here without touching caller-provided
-    # values. (fill_params() handles the CLI/list case.)
-    params.setdefault('-final_eignum', params.get('-final_eignum', 100))
-    params.setdefault('-calc_final', params.get('-calc_final', None))
-    params.setdefault('-filter', params.get('-filter', None))
+    # When run_GSE() is called programmatically (already-parsed params), some
+    # supported public keys may be absent. Set minimal defaults here without
+    # adding hidden register_zf implementation knobs to the run dictionary.
+    params.setdefault('-final_eignum', 100)
+    params.setdefault('-calc_final', None)
+    params.setdefault('-scales', 1)
+    params.setdefault('-coarsen_infomap', None)
+    if '-coarsen_K' in params:
+        try:
+            sysOps.throw_status('Ignoring legacy -coarsen_K; final coarsening uses final Infomap labels directly.')
+        except Exception:
+            pass
+        params.pop('-coarsen_K', None)
+    params.setdefault('-register_zf', None)
+    params.setdefault('-slice_path', None)
+    params['-register_zf'] = _param_optional_str(params, '-register_zf')
+    params['-slice_path'] = _param_optional_str(params, '-slice_path')
+    _validate_coarsen_alignment_mode(params)
     inference_eignum = int(params['-inference_eignum'])
     inference_dim = int(params['-inference_dim'])
-    # '-scales' is a legacy multi-outer-iter knob (default: 1)
-    params.setdefault('-scales', 1)
     worker_processes = NTHREADS
 
     # Freeze label_root derived from -calc_final before any downstream path rewrites.
@@ -213,45 +274,45 @@ def run_GSE(output_name, params, coarsen=True):
             params['_h5ad_label_root'] = _cf if os.path.isabs(_cf) else os.path.abspath(os.path.join(_base, _cf))
     # Expose also via sysOps so downstream helpers (h5ad builder) can find it.
     sysOps.h5ad_label_root = params.get('_h5ad_label_root', None)
+    _h5ad_label_root = params.get('_h5ad_label_root', None)
+    # Match v1 non-coarsen behavior: do not build final.h5ad during GSEobj
+    # construction.  Final coarsening/alignment, when requested, builds only
+    # the aggregate h5ad it needs after GSEoutput.txt has been produced.
+    sysOps.h5ad_build_initial = False
 
     sysOps.globaldatapath = str(params['-path'])
-    # Default: auto. If '-h5ad_include_sequences' is present, always include.
-    # Otherwise, include sequences only when label_pt appears STAR-less and contains sequences.
-    sysOps.h5ad_include_nonunique_genes = ('-h5ad_include_nonunique_genes' in params)
-    sysOps.h5ad_include_sequences = True if ('-h5ad_include_sequences' in params) else None
+    sysOps.h5ad_include_nonunique_genes = False
+    sysOps.h5ad_include_sequences = None
 
     sysOps.num_workers = worker_processes
     sysOps.throw_status("params = " + str(params))
 
     this_GSEobj = GSEobj(inference_dim, inference_eignum)
 
-    if this_GSEobj.seq_evecs is not None:
-        del this_GSEobj.seq_evecs
-    this_GSEobj.seq_evecs = None
-
     if not sysOps.check_file_exists("orig_evecs.npy"):
         sysOps.throw_status("this_GSEobj.link_data.data.shape = " + str(this_GSEobj.link_data.data.shape))
-        this_GSEobj.inference_eignum = int(1 * inference_eignum)
+        this_GSEobj.inference_eignum = inference_eignum
         this_GSEobj.eigen_decomp(orth=False, pmax=0)
-        this_GSEobj.inference_eignum = int(this_GSEobj.inference_eignum / 1)
         os.rename(sysOps.globaldatapath + "evecs.npy", sysOps.globaldatapath + "orig_evecs.npy")
         os.rename(sysOps.globaldatapath + "evals.npy", sysOps.globaldatapath + "orig_evals.npy")
     else:
         this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + "orig_evecs.npy").T
 
     if not sysOps.check_file_exists("orig_evecs_gapnorm.npy"):
-        Y = generalized_eigen_embedding(
-            this_GSEobj.seq_evecs.T,
-            this_GSEobj.link_data + this_GSEobj.link_data.T,
-            r=this_GSEobj.inference_eignum,
-        )
+        Y = rank_rotation_embedding(this_GSEobj.seq_evecs.T.dot(np.diag(1.0/np.maximum(1E-20,np.sqrt(1-np.load(sysOps.globaldatapath + "orig_evals.npy"))))))
         np.save(sysOps.globaldatapath + "orig_evecs_gapnorm.npy", Y)
 
+    # Do not run any coarsening or alignment before full_GSE.  This preserves
+    # bit-for-bit route identity with ordinary non-coarsen mode up through
+    # production of GSEoutput.txt, apart from cleanup of stale legacy aligned
+    # second-pass artifacts handled inside full_GSE().
     del this_GSEobj
 
     full_GSE(output_name, params)
 
-    if params['-calc_final'] is not None and not sysOps.check_file_exists("cluster_labels.npy"):
+    final_cluster_result = None
+    need_final_clustering = bool(params['-calc_final'] is not None or (coarsen and _final_coarsen_align_enabled(params)))
+    if need_final_clustering:
         # ------------------------------------------------------------------
         # Final post-embedding clustering
         #
@@ -260,20 +321,6 @@ def run_GSE(output_name, params, coarsen=True):
         # replace the separate hybrid_cluster dependency with several runs of
         # the updated execute_clusters_infomap() on the FINAL-embedding
         # transport graph.
-        #
-        # The output is saved as cluster_labels.npy with shape (N, 5):
-        #   col0 = hdbscan labels (final coords; min_cluster_size=10, min_samples=10)
-        #   col1 = infomap_final_default
-        #   col2 = infomap_final_min10
-        #   col3 = infomap_final_min10_frac90_k50
-        #   col4 = infomap_final_min10_mt2
-        #
-        # NOTE: col2 is intentionally retained as an explicit fixed-min10
-        # benchmark column, even though it currently matches the default.
-        #
-        # NOTE: keeping >4 columns is intentional so _build_augmented_h5ad()
-        # falls back to generic cluster_0.. names instead of stale hybrid-
-        # specific labels.
         # ------------------------------------------------------------------
         coords_df = pd.read_csv(sysOps.globaldatapath + str(output_name), header=None)
         Xpts_final = coords_df.iloc[:, 1:].values.astype(np.float64, copy=False)
@@ -304,34 +351,46 @@ def run_GSE(output_name, params, coarsen=True):
                     ex_meta = json.load(fh)
             except Exception:
                 ex_meta = None
-        # Only reuse cached final labels when the sidecar metadata says they
-        # match the current layout/version.
 
-        final_infomap_variants = [
-            ("default", {
-                "min_cluster_size": _FINAL_CLUSTER_MIN_CLUSTER_SIZE,
-            }),
-        ]
         desired_meta = {
             "layout_version": int(_FINAL_CLUSTER_LABELS_LAYOUT_VERSION),
             "hdbscan_min_cluster_size": int(_FINAL_CLUSTER_MIN_CLUSTER_SIZE),
             "hdbscan_min_samples": int(_FINAL_HDBSCAN_MIN_SAMPLES),
-            "infomap_variants": [
-                {"name": str(name), **variant_kwargs}
-                for name, variant_kwargs in final_infomap_variants
-            ],
+            "final_infomap_min_cluster_size": int(_FINAL_CLUSTER_MIN_CLUSTER_SIZE),
+            "final_infomap_enforce_min_cluster_size": bool(_FINAL_INFOMAP_ENFORCE_MIN_CLUSTER_SIZE),
+            "final_infomap_markov_time": float(_FINAL_INFOMAP_MARKOV_TIME),
+            "final_infomap_num_trials": int(_INFOMAP_NUM_TRIALS),
+            "final_infomap_protect_lcc": bool(_FINAL_INFOMAP_PROTECT_LCC),
+            "infomap_k_per_row": int(_INFOMAP_K_PER_ROW),
+            "infomap_weight_fraction_per_row": float(_INFOMAP_WEIGHT_FRACTION_PER_ROW),
+            "infomap_min_edges_per_row": int(_INFOMAP_MIN_EDGES_PER_ROW),
+
+            "final_raw_connected_component_split": True,
+            "final_raw_connected_component_split_graph": os.path.basename(link_path),
+            "final_hdbscan_raw_connected_component_split_min_component_size": int(
+                _FINAL_CLUSTER_MIN_CLUSTER_SIZE
+            ),
+            "final_infomap_raw_connected_component_split_min_component_size": int(
+                _FINAL_CLUSTER_MIN_CLUSTER_SIZE
+            ),
+
         }
-        expected_label_cols = 1 + len(final_infomap_variants)
+        expected_label_cols = 2
         reuse_final_clusters = (
             (ex_mat is not None)
             and (ex_mat.shape[1] == expected_label_cols)
-            and (ex_meta is not None)
-            and (int(ex_meta.get("layout_version", -1)) == int(_FINAL_CLUSTER_LABELS_LAYOUT_VERSION))
+            and isinstance(ex_meta, dict)
+            and (ex_meta == desired_meta)
         )
         need_hdbscan = not reuse_final_clusters
         need_any_final_infomap = not reuse_final_clusters
+        need_final_tm = bool(need_any_final_infomap or (coarsen and _final_coarsen_align_enabled(params)))
 
-        from clusterplot import execute_clusters_hdbscan, execute_clusters_infomap
+        from clusterplot import (
+            execute_clusters_hdbscan,
+            execute_clusters_infomap,
+            split_clusters_by_raw_connected_components,
+        )
 
         if need_hdbscan:
             sysOps.throw_status(
@@ -345,6 +404,13 @@ def run_GSE(output_name, params, coarsen=True):
                 min_cluster_size=_FINAL_CLUSTER_MIN_CLUSTER_SIZE,
                 min_samples=_FINAL_HDBSCAN_MIN_SAMPLES,
             ).astype(np.int32, copy=False)
+            labels_hdbscan = split_clusters_by_raw_connected_components(
+                labels_hdbscan,
+                link_csr,
+                min_component_size=_FINAL_CLUSTER_MIN_CLUSTER_SIZE,
+                route_name="final_hdbscan",
+            ).astype(np.int32, copy=False)
+
         else:
             labels_hdbscan = ex_mat[:, 0].astype(np.int32, copy=False)
 
@@ -354,7 +420,7 @@ def run_GSE(output_name, params, coarsen=True):
         tm_final_name = f"transformed_matrix_final_{base}.npz"
         tm_final_path = os.path.join(sysOps.globaldatapath, tm_final_name)
 
-        if need_any_final_infomap:
+        if need_final_tm:
             if not os.path.exists(tm_final_path):
                 sysOps.throw_status(
                     "Building transformed matrix from FINAL embedding: " + tm_final_name
@@ -373,30 +439,38 @@ def run_GSE(output_name, params, coarsen=True):
                 )
 
         num_threads = int(getattr(sysOps, "num_workers", NTHREADS))
-        final_infomap_cols = []
-        for col_idx, (variant_name, variant_kwargs) in enumerate(final_infomap_variants, start=1):
-            if reuse_final_clusters:
-                labels_variant = ex_mat[:, col_idx].astype(np.int32, copy=False)
-            else:
-                sysOps.throw_status(
-                    "Running final Infomap variant '" + str(variant_name) +
-                    "' on transformed matrix derived from FINAL embedding."
-                )
-                infomap_kwargs = dict(
-                    transformed_matrix_path=tm_final_path,
-                    out_dir=os.path.join(sysOps.globaldatapath, "tmp", f"infomap_tm_final_{variant_name}"),
-                    out_name=f"tm_modules_final_{variant_name}_{base}",
-                    seed=1,
-                    num_trials=10,
-                    silent=True,
-                    num_threads=num_threads,
-                )
-                infomap_kwargs.update(variant_kwargs)
-                labels_variant = execute_clusters_infomap(**infomap_kwargs).astype(np.int32, copy=False)
-            final_infomap_cols.append(labels_variant)
+        if reuse_final_clusters:
+            labels_infomap = ex_mat[:, 1].astype(np.int32, copy=False)
+        else:
+            sysOps.throw_status(
+                "Running final Infomap on transformed matrix derived from FINAL embedding."
+            )
+            labels_infomap = execute_clusters_infomap(
+                transformed_matrix_path=tm_final_path,
+                out_dir=os.path.join(sysOps.globaldatapath, "tmp", "infomap_tm_final"),
+                out_name=f"tm_modules_final_{base}",
+                seed=1,
+                num_trials=int(_INFOMAP_NUM_TRIALS),
+                silent=True,
+                k_per_row=int(_INFOMAP_K_PER_ROW),
+                weight_fraction_per_row=float(_INFOMAP_WEIGHT_FRACTION_PER_ROW),
+                min_edges_per_row=int(_INFOMAP_MIN_EDGES_PER_ROW),
+                min_cluster_size=int(_FINAL_CLUSTER_MIN_CLUSTER_SIZE),
+                enforce_min_cluster_size=bool(_FINAL_INFOMAP_ENFORCE_MIN_CLUSTER_SIZE),
+                infomap_markov_time=float(_FINAL_INFOMAP_MARKOV_TIME),
+                protect_lcc=bool(_FINAL_INFOMAP_PROTECT_LCC),
+                num_threads=num_threads,
+            ).astype(np.int32, copy=False)
+            labels_infomap = split_clusters_by_raw_connected_components(
+                labels_infomap,
+                link_csr,
+                min_component_size=_FINAL_CLUSTER_MIN_CLUSTER_SIZE,
+                route_name="final_infomap",
+            ).astype(np.int32, copy=False)
 
-        # Combine: hdbscan + multiple FINAL-transport Infomap parameterizations.
-        cluster_labels = np.column_stack([labels_hdbscan] + final_infomap_cols).astype(np.int32, copy=False)
+        # Combine: hdbscan + FINAL-transport Infomap.
+        cluster_labels = np.column_stack([labels_hdbscan, labels_infomap]).astype(np.int32, copy=False)
+
         np.save(cl_path, cluster_labels)
         try:
             with open(cl_meta_path, "w") as fh:
@@ -404,31 +478,588 @@ def run_GSE(output_name, params, coarsen=True):
         except Exception as e:
             sysOps.throw_status("Warning: could not write cluster_labels_meta.json: " + str(e))
 
+        final_cluster_result = {
+            'Xpts_final': Xpts_final,
+            'link_csr': link_csr,
+            'link_path': link_path,
+            'tm_final_path': tm_final_path,
+            'labels_infomap': labels_infomap,
+            'cluster_labels_path': cl_path,
+            'cluster_labels_meta_path': cl_meta_path,
+            'output_base': base,
+        }
+
     if params['-calc_final'] is not None:
         sysOps.throw_status("Calculating final : " + str(sysOps.h5ad_label_root))
-        # Defer building the AnnData/h5ad until the very end so it can include
-        # downstream results (GSEoutput + optional cluster labels) and to avoid
-        # paying the IO cost during every GSEobj instantiation.
-        if os.path.isdir(sysOps.h5ad_label_root):
+        # Match v1 non-coarsen behavior: final.h5ad is deferred until the
+        # end and gated by the resolved label-root directory, not by the
+        # h5ad_build_initial flag used only for early/base AnnData construction.
+        if sysOps.h5ad_label_root is not None and os.path.isdir(str(sysOps.h5ad_label_root)):
             _build_augmented_h5ad(
                 group_path=sysOps.globaldatapath,
                 gse_output_name=str(output_name),
             )
 
-    if params.get('-filter'):
-        if output_name is None:
-            raise ValueError("-filter requires an output_name/GSEoutput file.")
-        sysOps.throw_status("-filter enabled: exporting filtered subgraph and launching child rerun.")
-        filtered_path = _export_filtered_subgraph_from_gse(
-            base_path=sysOps.globaldatapath,
+    if coarsen and _final_coarsen_align_enabled(params):
+        if final_cluster_result is None:
+            raise RuntimeError('Final coarsen-and-align requested, but final Infomap clustering did not run.')
+        _run_final_coarsen_align_pipeline(
+            params=params,
             output_name=str(output_name),
+            final_cluster_result=final_cluster_result,
         )
-        child_params = dict(params)
-        child_params['-path'] = filtered_path
-        child_params['-filter'] = None
-        if params.get('_h5ad_label_root') is not None:
-            child_params['_h5ad_label_root'] = params['_h5ad_label_root']
-        run_GSE(output_name, child_params, coarsen=coarsen)
+
+
+def _resolve_h5ad_builder_options(
+    group_path: str,
+    *,
+    label_root: str | None = None,
+    binary: bool = False,
+) -> dict:
+    from annotation import _find_upwards, _looks_like_dna_seq_list
+
+    include_sequences_cfg = getattr(sysOps, "h5ad_include_sequences", False)
+    include_sequences = bool(include_sequences_cfg) if include_sequences_cfg is not None else None
+    if include_sequences is None:
+        search_root = label_root if label_root is not None else group_path
+
+        label_pt_paths = []
+        for _amp in (0, 1):
+            for fn in (f"label_pt{_amp}.txt", f"label_pts{_amp}.txt"):
+                lp = _find_upwards(search_root, fn)
+                if lp is None:
+                    lp = _find_upwards(group_path, fn)
+                if lp:
+                    label_pt_paths.append(lp)
+                    break
+
+        def _has_nonneg_start(start_field: str) -> bool:
+            if not start_field:
+                return False
+            placeholders = {"NA", "N/A", "NONE", "None"}
+            for sub in start_field.split(";"):
+                sub = sub.strip()
+                if not sub:
+                    continue
+                for tok in sub.split("|"):
+                    tok = tok.strip()
+                    if (not tok) or (tok == "-1"):
+                        continue
+                    if tok in placeholders or tok.upper() in placeholders:
+                        continue
+                    try:
+                        if int(tok) >= 0:
+                            return True
+                    except ValueError:
+                        continue
+            return False
+
+        seq_like = False
+        star_seen = False
+        for _amp in (0, 1):
+            if os.path.isdir(os.path.join(search_root, f"STARalignment{_amp}")):
+                star_seen = True
+                break
+
+        n_probe = 0
+        for lp in label_pt_paths:
+            try:
+                with open(lp, "r") as _f:
+                    for _line in _f:
+                        _line = _line.strip()
+                        if not _line:
+                            continue
+                        _fields = _line.split(",")
+                        if len(_fields) > 8 and _looks_like_dna_seq_list(_fields[8].strip()):
+                            seq_like = True
+                        if len(_fields) > 1 and _has_nonneg_start(_fields[1].strip()):
+                            star_seen = True
+                        n_probe += 1
+                        if (seq_like and star_seen) or (n_probe >= 2000):
+                            break
+            except OSError:
+                continue
+            if (seq_like and star_seen) or (n_probe >= 2000):
+                break
+
+        include_sequences = bool(seq_like and (not star_seen))
+
+    include_nonunique_genes = bool(getattr(sysOps, "h5ad_include_nonunique_genes", False))
+    return {
+        "label_root": label_root,
+        "include_sequences": include_sequences,
+        "include_nonunique_genes": include_nonunique_genes,
+        "binary": bool(binary),
+    }
+
+
+
+def _find_h5ad_annotation_source_paths(
+    group_path: str,
+    *,
+    label_root: str | None = None,
+) -> list[str]:
+    from annotation import _find_upwards
+
+    group_path = str(group_path)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    index_key_path = os.path.join(group_path, "index_key.npy")
+    if not os.path.exists(index_key_path):
+        try:
+            _restore_missing_subset_index_key(group_path)
+        except Exception as e:
+            sysOps.throw_status("Warning: could not restore missing index_key.npy: " + str(e))
+    if os.path.exists(index_key_path):
+        out.append(index_key_path)
+        seen.add(index_key_path)
+
+    search_roots = []
+    if label_root is not None:
+        search_roots.append(str(label_root))
+    search_roots.append(group_path)
+
+    for search_root in search_roots:
+        for _amp in (0, 1):
+            for fn in (f"label_pt{_amp}.txt", f"label_pts{_amp}.txt"):
+                lp = _find_upwards(search_root, fn)
+                if lp and lp not in seen:
+                    out.append(lp)
+                    seen.add(lp)
+                    break
+
+    return out
+
+def _write_h5ad_atomic(adata, h5ad_out: str) -> None:
+    try:
+        import anndata as _anndata
+        if hasattr(_anndata, "settings") and hasattr(_anndata.settings, "allow_write_nullable_strings"):
+            _anndata.settings.allow_write_nullable_strings = True
+    except Exception:
+        pass
+
+    tmp_h5ad_out = h5ad_out + ".tmp"
+    try:
+        try:
+            if os.path.exists(tmp_h5ad_out):
+                os.remove(tmp_h5ad_out)
+        except Exception:
+            pass
+
+        try:
+            adata.write_h5ad(tmp_h5ad_out, compression="gzip", compression_opts=4)
+        except TypeError:
+            adata.write_h5ad(tmp_h5ad_out)
+
+        os.replace(tmp_h5ad_out, h5ad_out)
+    except Exception:
+        try:
+            if os.path.exists(tmp_h5ad_out):
+                os.remove(tmp_h5ad_out)
+        except Exception:
+            pass
+        raise
+
+
+
+def _ensure_initial_h5ad(
+    group_path: str,
+    *,
+    h5ad_filename: str = "final.h5ad",
+    binary: bool = False,
+) -> str:
+    from annotation import build_umi_gene_anndata
+
+    group_path = _ensure_trailing_slash(str(group_path))
+    h5ad_out = os.path.join(group_path, h5ad_filename)
+    label_root = getattr(sysOps, "h5ad_label_root", None)
+
+    if os.path.exists(h5ad_out):
+        return h5ad_out
+
+    annotation_sources = _find_h5ad_annotation_source_paths(group_path, label_root=label_root)
+
+    opts = _resolve_h5ad_builder_options(group_path, label_root=label_root, binary=binary)
+    sysOps.throw_status("Building initial AnnData ...")
+    adata = build_umi_gene_anndata(
+        group_path=group_path,
+        label_root=opts["label_root"],
+        return_anndata=True,
+        include_sequences=opts["include_sequences"],
+        include_nonunique_genes=opts["include_nonunique_genes"],
+        binary=opts["binary"],
+    )
+
+    if not hasattr(adata, "obs") or not hasattr(adata, "write_h5ad"):
+        raise TypeError(
+            "build_umi_gene_anndata did not return an AnnData object; got "
+            + str(type(adata))
+        )
+
+    adata.uns["h5ad_build_stage"] = "base"
+    adata.uns["h5ad_annotation_only"] = True
+    adata.uns["h5ad_annotation_sources"] = [os.path.abspath(p) for p in annotation_sources]
+    _write_h5ad_atomic(adata, h5ad_out)
+    sysOps.throw_status("Saved initial AnnData to " + h5ad_out)
+    return h5ad_out
+
+
+
+def _drop_existing_gse_from_adata(adata) -> None:
+    for col in [c for c in list(adata.obs.columns) if str(c).startswith("GSE_")]:
+        del adata.obs[col]
+    if hasattr(adata, "obsm") and "X_gse" in adata.obsm:
+        del adata.obsm["X_gse"]
+    for key in (
+        "GSEoutput_source",
+        "GSEoutput_source_kind",
+        "GSEoutput_pre_coarsen_align_prior_source",
+        "GSEoutput_coarsen_align_prior_refine_meta",
+        "GSEoutput_coarsen_align_second_pass_operator_meta",
+    ):
+        if key in adata.uns:
+            del adata.uns[key]
+
+
+
+def _drop_existing_cluster_labels_from_adata(adata) -> None:
+    colnames = []
+    try:
+        colnames.extend([str(c) for c in adata.uns.get("cluster_labels_columns", [])])
+    except Exception:
+        pass
+    for c in list(adata.obs.columns):
+        cs = str(c)
+        if cs == "cluster" or cs.startswith("cluster_"):
+            colnames.append(cs)
+    for name in sorted(set(colnames)):
+        if name in adata.obs.columns:
+            del adata.obs[name]
+    for key in (
+        "cluster_labels_source",
+        "cluster_labels_shape",
+        "cluster_labels_columns",
+        "cluster_labels_methods",
+    ):
+        if key in adata.uns:
+            del adata.uns[key]
+
+
+
+def _attach_gseoutput_to_adata(adata, gse_path: str | None) -> bool:
+    _drop_existing_gse_from_adata(adata)
+    if not gse_path or not os.path.exists(gse_path):
+        return False
+
+    try:
+        full = np.loadtxt(gse_path, delimiter=",", dtype=np.float32)
+        if full.ndim == 1:
+            full = full.reshape(1, -1)
+        if full.shape[1] < 2:
+            return False
+
+        idx = full[:, 0].astype(np.int64)
+        coords = full[:, 1:].astype(np.float32)
+        if coords.shape[0] == adata.n_obs and np.array_equal(idx, np.arange(coords.shape[0], dtype=np.int64)):
+            X_gse = coords
+        elif coords.shape[0] == adata.n_obs:
+            X_gse = coords
+        else:
+            sysOps.throw_status("Warning: GSE coordinate array size does not match AnnData, mapping via explicit node_index column.")
+            X_gse = np.full((adata.n_obs, coords.shape[1]), np.nan, dtype=np.float32)
+            mask = (idx >= 0) & (idx < adata.n_obs)
+            X_gse[idx[mask]] = coords[mask]
+
+        gse_cols = [f"GSE_{i+1}" for i in range(X_gse.shape[1])]
+        for i, col in enumerate(gse_cols):
+            adata.obs[col] = X_gse[:, i]
+        adata.obsm["X_gse"] = np.asarray(X_gse, dtype=np.float32)
+        adata.uns["GSEoutput_source"] = os.path.basename(gse_path)
+
+        adata.uns["GSEoutput_source_kind"] = "ordinary_full_GSE"
+        return True
+    except Exception as e:
+        sysOps.throw_status("ERROR: could not attach GSEoutput to AnnData: " + str(e))
+        raise
+
+
+
+def _attach_cluster_labels_to_adata(adata, cl_path: str | None, *, gse_path: str | None = None) -> bool:
+    _drop_existing_cluster_labels_from_adata(adata)
+    if not cl_path or not os.path.exists(cl_path):
+        return False
+
+    try:
+        cl_raw = np.asarray(np.load(cl_path))
+        if cl_raw.ndim == 0:
+            raise ValueError("cluster_labels.npy contained a scalar; expected (N,) or (N,K)")
+
+        if cl_raw.ndim == 1:
+            cl_mat = cl_raw.reshape(-1, 1)
+        elif cl_raw.ndim == 2:
+            cl_mat = cl_raw
+        else:
+            cl_mat = cl_raw.reshape(cl_raw.shape[0], -1)
+
+        if cl_mat.shape[0] != adata.n_obs and cl_mat.shape[1] == adata.n_obs:
+            cl_mat = cl_mat.T
+
+        mapped = None
+        if cl_mat.shape[0] == adata.n_obs:
+            mapped = np.asarray(cl_mat, dtype=np.int32)
+        else:
+            if gse_path and os.path.exists(gse_path):
+                gse_full = np.loadtxt(gse_path, delimiter=",", dtype=np.int64)
+                if gse_full.ndim == 1:
+                    gse_full = gse_full.reshape(1, -1)
+                idx = gse_full[:, 0].astype(np.int64, copy=False)
+                if idx.shape[0] != cl_mat.shape[0] and idx.shape[0] == cl_mat.shape[1]:
+                    cl_mat = cl_mat.T
+                if idx.shape[0] == cl_mat.shape[0]:
+                    out = np.full((adata.n_obs, cl_mat.shape[1]), -1, dtype=np.int32)
+                    mask = (idx >= 0) & (idx < adata.n_obs)
+                    out[idx[mask], :] = np.asarray(cl_mat[mask, :], dtype=np.int32)
+                    mapped = out
+                else:
+                    sysOps.throw_status(
+                        "Warning: cluster_labels.npy does not match AnnData, and its first dimension does not match GSEoutput; skipping."
+                    )
+            else:
+                sysOps.throw_status("Warning: cluster_labels.npy does not match AnnData and no GSEoutput present; skipping.")
+
+        if mapped is None:
+            return False
+
+        n_cols = int(mapped.shape[1])
+        if n_cols == 1:
+            colnames = ["cluster"]
+        elif n_cols == 2:
+            colnames = ["cluster_hdbscan", "cluster_infomap"]
+            adata.uns["cluster_labels_methods"] = ["hdbscan", "infomap"]
+        elif n_cols == 3:
+            colnames = [
+                "cluster_hdbscan",
+                "cluster_infomap",
+                "cluster_infomap_final",
+            ]
+            adata.uns["cluster_labels_methods"] = [
+                "hdbscan",
+                "infomap",
+                "infomap_final",
+            ]
+        elif n_cols == 4:
+            colnames = [
+                "cluster_hdbscan",
+                "cluster_infomap",
+                "cluster_infomap_final",
+                "cluster_infomap_final_hybrid",
+            ]
+            adata.uns["cluster_labels_methods"] = [
+                "hdbscan",
+                "infomap",
+                "infomap_final",
+                "infomap_final_hybrid",
+            ]
+        else:
+            colnames = [f"cluster_{i}" for i in range(n_cols)]
+
+        for j, name in enumerate(colnames):
+            adata.obs[name] = np.asarray(mapped[:, j], dtype=np.int32)
+
+        adata.uns["cluster_labels_source"] = os.path.basename(cl_path)
+        adata.uns["cluster_labels_shape"] = [int(x) for x in mapped.shape]
+        adata.uns["cluster_labels_columns"] = colnames
+        return True
+    except Exception as e:
+        sysOps.throw_status("ERROR: could not attach cluster labels to AnnData: " + str(e))
+        raise
+
+
+
+def _read_h5ad_sparse_matrix_to_csr(mat):
+    if hasattr(mat, "to_memory"):
+        mat = mat.to_memory()
+    elif hasattr(mat, "__getitem__") and not scipy.sparse.issparse(mat):
+        try:
+            mat = mat[:]
+        except Exception:
+            pass
+    if scipy.sparse.issparse(mat):
+        return mat.tocsr()
+    return csr_matrix(np.asarray(mat))
+
+
+
+def _binarize_sparse_for_coarsening(mat, threshold: int) -> csr_matrix:
+    X = _read_h5ad_sparse_matrix_to_csr(mat).copy()
+    if X.nnz > 0:
+        X.data = (X.data >= threshold).astype(np.int32, copy=False)
+        X.eliminate_zeros()
+        X.sort_indices()
+    return X
+
+
+
+def _build_local_super_membership_csr(node2super, keep_super):
+    node2super = np.asarray(node2super, dtype=np.int64).ravel()
+    keep_super = np.asarray(keep_super, dtype=np.int64).ravel()
+    n_keep = int(keep_super.size)
+    if n_keep == 0:
+        node2local = np.full(node2super.shape[0], -1, dtype=np.int64)
+        return node2local, _build_membership_csr(node2local, 0, dtype=np.int32)
+
+    max_super = int(max(
+        int(np.max(node2super[node2super >= 0])) if np.any(node2super >= 0) else -1,
+        int(np.max(keep_super)),
+    )) + 1
+    super_to_local = np.full(max_super, -1, dtype=np.int64)
+    super_to_local[keep_super] = np.arange(n_keep, dtype=np.int64)
+
+    node2local = np.full(node2super.shape[0], -1, dtype=np.int64)
+    valid = (node2super >= 0) & (node2super < max_super)
+    if np.any(valid):
+        node2local[valid] = super_to_local[node2super[valid]]
+    return node2local, _build_membership_csr(node2local, n_keep, dtype=np.int32)
+
+
+
+def _coarsen_h5ad_sparse_matrix(parent_mat, membership_csr: csr_matrix, *, threshold: int) -> csr_matrix:
+    X_bin = _binarize_sparse_for_coarsening(parent_mat, int(threshold))
+    if membership_csr.shape[0] != X_bin.shape[0]:
+        raise ValueError(
+            "Membership matrix row count " + str(membership_csr.shape[0]) +
+            " does not match sparse annotation matrix row count " + str(X_bin.shape[0]) + "."
+        )
+    X_coarse = (membership_csr.T @ X_bin).tocsr()
+    X_coarse.sum_duplicates()
+    X_coarse.eliminate_zeros()
+    X_coarse.sort_indices()
+    return X_coarse
+
+
+
+def _write_gseoutput_from_coords(out_path: str, coords: np.ndarray) -> None:
+    coords = np.asarray(coords, dtype=np.float64)
+    if coords.ndim == 1:
+        coords = coords.reshape(-1, 1)
+    local_ids = np.arange(coords.shape[0], dtype=np.int64).reshape(-1, 1)
+    out = np.concatenate([local_ids, coords], axis=1)
+    fmt = '%i,' + ','.join(['%.10e' for _ in range(coords.shape[1])])
+    np.savetxt(out_path, out, fmt=fmt, delimiter=',')
+
+
+
+def _build_coarsened_h5ad_from_parent(
+    parent_group_path: str,
+    coarse_group_path: str,
+    *,
+    node2super: np.ndarray,
+    keep_super: np.ndarray,
+    super_size: np.ndarray,
+    parent_h5ad_filename: str = "final.h5ad",
+    coarse_h5ad_filename: str = "final.h5ad",
+    gse_output_name: str = "GSEoutput.txt",
+    annotation_binary_threshold: int = _COARSEN_ANNOTATION_BINARIZE_THRESHOLD,
+    extra_source_paths: list[str] | None = None,
+) -> None:
+    try:
+        import anndata as _anndata
+
+        parent_group_path = _ensure_trailing_slash(str(parent_group_path))
+        coarse_group_path = _ensure_trailing_slash(str(coarse_group_path))
+        parent_h5ad_path = os.path.join(parent_group_path, parent_h5ad_filename)
+        coarse_h5ad_path = os.path.join(coarse_group_path, coarse_h5ad_filename)
+        gse_path = os.path.join(coarse_group_path, gse_output_name) if gse_output_name else None
+
+        if not os.path.exists(parent_h5ad_path):
+            _ensure_initial_h5ad(parent_group_path, h5ad_filename=parent_h5ad_filename, binary=False)
+
+        if os.path.exists(coarse_h5ad_path):
+            sysOps.throw_status("Found existing " + coarse_h5ad_path + "; skipping coarse h5ad rebuild.")
+            return False
+
+        node2super = np.asarray(node2super, dtype=np.int64).ravel()
+        keep_super = np.asarray(keep_super, dtype=np.int64).ravel()
+        super_size = np.asarray(super_size, dtype=np.int64).ravel()
+        _, membership_csr = _build_local_super_membership_csr(node2super, keep_super)
+
+        parent_adata = _anndata.read_h5ad(parent_h5ad_path, backed='r')
+        try:
+            if int(parent_adata.n_obs) != int(node2super.shape[0]):
+                raise ValueError(
+                    "Parent AnnData n_obs=" + str(parent_adata.n_obs) +
+                    " does not match node2super length=" + str(node2super.shape[0]) + "."
+                )
+
+            X_coarse = _coarsen_h5ad_sparse_matrix(
+                parent_adata.X,
+                membership_csr,
+                threshold=int(annotation_binary_threshold),
+            )
+
+            obs_df = pd.DataFrame(index=pd.Index(np.arange(keep_super.shape[0], dtype=np.int32), name='node_id'))
+            obs_df['supernode_index'] = keep_super.astype(np.int64, copy=False)
+            if keep_super.size > 0 and super_size.size > 0 and np.max(keep_super) < super_size.size:
+                obs_df['n_fine_nodes'] = super_size[keep_super].astype(np.int64, copy=False)
+            if 'has_label' in parent_adata.obs.columns:
+                has_label = np.asarray(parent_adata.obs['has_label']).astype(np.int64, copy=False)
+                obs_df['n_labeled_fine_nodes'] = np.asarray(membership_csr.T @ has_label).reshape(-1)
+            if 'total_sub_reads' in parent_adata.obs.columns:
+                total_sub_reads = np.asarray(parent_adata.obs['total_sub_reads']).astype(np.int64, copy=False)
+                obs_df['total_sub_reads'] = np.asarray(membership_csr.T @ total_sub_reads).reshape(-1)
+
+            var_df = parent_adata.var.copy()
+            obs_df.index = obs_df.index.astype(str)
+            var_df.index = var_df.index.astype(str)
+            adata_coarse = _anndata.AnnData(X=X_coarse, obs=obs_df, var=var_df)
+
+            for layer_name in list(parent_adata.layers.keys()):
+                try:
+                    layer_threshold = 1 if str(layer_name) == 'seq' else int(annotation_binary_threshold)
+                    adata_coarse.layers[str(layer_name)] = _coarsen_h5ad_sparse_matrix(
+                        parent_adata.layers[layer_name],
+                        membership_csr,
+                        threshold=layer_threshold,
+                    )
+                except Exception as e:
+                    sysOps.throw_status(
+                        "Warning: could not coarsen layer '" + str(layer_name) + "': " + str(e)
+                    )
+
+            for key in (
+                'label_pt_paths',
+                'label_pt_amps',
+                'index_key_path',
+                'include_sequences',
+                'include_nonunique_genes',
+                'include_obs_strings',
+                'genome_feature_prefix',
+                'h5ad_annotation_sources',
+            ):
+                if key in parent_adata.uns:
+                    adata_coarse.uns[key] = parent_adata.uns[key]
+            adata_coarse.uns['h5ad_build_stage'] = 'coarsened'
+            adata_coarse.uns['h5ad_annotation_only'] = False
+            adata_coarse.uns['h5ad_coarsened_from'] = os.path.abspath(parent_h5ad_path)
+            adata_coarse.uns['h5ad_coarse_index_key_path'] = os.path.join(coarse_group_path, 'index_key.npy')
+            adata_coarse.uns['h5ad_annotation_binary_threshold'] = int(annotation_binary_threshold)
+            adata_coarse.uns['coarse_supernode_count'] = int(keep_super.shape[0])
+
+            _attach_gseoutput_to_adata(adata_coarse, gse_path)
+            _write_h5ad_atomic(adata_coarse, coarse_h5ad_path)
+            sysOps.throw_status("Saved coarsened AnnData to " + coarse_h5ad_path)
+            return True
+        finally:
+            try:
+                if getattr(parent_adata, 'file', None) is not None:
+                    parent_adata.file.close()
+            except Exception:
+                pass
+    except Exception as e:
+        sysOps.throw_status("ERROR: could not build/save coarsened AnnData: " + str(e))
+        raise
+
 
 
 def _build_augmented_h5ad(
@@ -439,311 +1070,27 @@ def _build_augmented_h5ad(
     cluster_labels_name: str = "cluster_labels.npy",
     binary: bool = False,
 ) -> None:
-    """Build final.h5ad at the end of run_GSE and attach downstream results.
-
-    This is intentionally separated from GSEobj.load_data() so:
-      - expensive IO does not happen during every GSEobj instantiation
-      - the h5ad can include GSEoutput coordinates and (optionally) cluster labels
-
-    Adds (when available):
-      - adata.obs['GSE_1'..] from <gse_output_name> (columns 2..end, float32)
-      - adata.obs['cluster'] (legacy 1D) OR method-specific cluster columns from <cluster_labels_name> (int32)
-
-
-    The function is best-effort: missing optional files will be skipped.
-    """
+    """Complete final.h5ad from the initial annotation-only AnnData written at first GSEobj construction."""
     try:
-        group_path = str(group_path)
-        h5ad_out = os.path.join(group_path, h5ad_filename)
+        group_path = _ensure_trailing_slash(str(group_path))
+        h5ad_out = _ensure_initial_h5ad(group_path, h5ad_filename=h5ad_filename, binary=binary)
         gse_path = os.path.join(group_path, gse_output_name) if gse_output_name else None
         cl_path = os.path.join(group_path, cluster_labels_name)
-        index_key_path = os.path.join(group_path, "index_key.npy")
 
-        # Ensure a local subset mapping exists before any freshness check / upward search.
-        if not os.path.exists(index_key_path):
-            try:
-                _restore_missing_subset_index_key(group_path)
-            except Exception as e:
-                sysOps.throw_status("Warning: could not restore missing index_key.npy: " + str(e))
+        import anndata as _anndata
 
-        # Rebuild only if missing or stale w.r.t downstream outputs.
-        if os.path.exists(h5ad_out):
-            try:
-                h5_mtime = os.path.getmtime(h5ad_out)
-                newest_src = h5_mtime
-                for p in (gse_path, cl_path, index_key_path):
-                    if p and os.path.exists(p):
-                        newest_src = max(newest_src, os.path.getmtime(p))
-                if newest_src <= h5_mtime:
-                    sysOps.throw_status("Found up-to-date " + h5ad_out + "; skipping h5ad rebuild.")
-                    return
-            except Exception:
-                # If mtime checks fail, fall through and rebuild.
-                pass
-
-        from annotation import build_umi_gene_anndata, _find_upwards, _looks_like_dna_seq_list
-
-        include_sequences_cfg = getattr(sysOps, "h5ad_include_sequences", False)
-        include_sequences = bool(include_sequences_cfg) if include_sequences_cfg is not None else None
-        if include_sequences is None:
-            # Auto: include sequences only when label_pt appears STAR-less and contains sequences.
-            label_root = getattr(sysOps, "h5ad_label_root", None)
-            search_root = label_root if label_root is not None else group_path
-
-            # Locate label_pt paths the same way build_umi_gene_anndata() does.
-            label_pt_paths = []
-            for _amp in (0, 1):
-                fn = f"label_pt{_amp}.txt"
-                lp = _find_upwards(search_root, fn)
-                if lp is None:
-                    lp = _find_upwards(group_path, fn)
-                if lp:
-                    label_pt_paths.append(lp)
-
-            def _has_nonneg_start(start_field: str) -> bool:
-                if not start_field:
-                    return False
-                placeholders = {"NA", "N/A", "NONE", "None"}
-                for sub in start_field.split(";"):
-                    sub = sub.strip()
-                    if not sub:
-                        continue
-                    for tok in sub.split("|"):
-                        tok = tok.strip()
-                        if (not tok) or (tok == "-1"):
-                            continue
-                        if tok in placeholders or tok.upper() in placeholders:
-                            continue
-                        try:
-                            if int(tok) >= 0:
-                                return True
-                        except ValueError:
-                            continue
-                return False
-
-            seq_like = False
-            # Detect STAR having run via STARalignment*/ directories (more robust than sampling aln_start values).
-            star_seen = False
-            for _amp in (0, 1):
-                if os.path.isdir(os.path.join(search_root, f"STARalignment{_amp}")):
-                    star_seen = True
-                    break
-
-            n_probe = 0
-            for lp in label_pt_paths:
-                try:
-                    with open(lp, "r") as _f:
-                        for _line in _f:
-                            _line = _line.strip()
-                            if not _line:
-                                continue
-                            _fields = _line.split(",")
-                            if len(_fields) > 8 and _looks_like_dna_seq_list(_fields[8].strip()):
-                                seq_like = True
-                            if len(_fields) > 1 and _has_nonneg_start(_fields[1].strip()):
-                                star_seen = True
-                            n_probe += 1
-                            if (seq_like and star_seen) or (n_probe >= 2000):
-                                break
-                except OSError:
-                    continue
-                if (seq_like and star_seen) or (n_probe >= 2000):
-                    break
-
-            include_sequences = bool(seq_like and (not star_seen))
-        include_nonunique_genes = bool(getattr(sysOps, "h5ad_include_nonunique_genes", False))
-        label_root = getattr(sysOps, "h5ad_label_root", None)
-
-        sysOps.throw_status("Building AnnData ...")
-        adata = build_umi_gene_anndata(
-            group_path=group_path,
-            label_root=label_root,
-            return_anndata=True,
-            include_sequences=include_sequences,
-            include_nonunique_genes=include_nonunique_genes,
-            binary=bool(binary),
-        )
-
-        # If anndata isn't installed, builder can return a tuple instead of AnnData.
-        # Treat that as a hard failure here; otherwise resume can appear "successful"
-        # while silently leaving no usable final.h5ad behind.
-
-        if not hasattr(adata, "obs") or not hasattr(adata, "write_h5ad"):
-            raise TypeError(
-                "build_umi_gene_anndata did not return an AnnData object; got "
-                + str(type(adata))
-            )
-
-        # -------------------------
-        # Attach GSE coordinates
-        # -------------------------
-        if gse_path and os.path.exists(gse_path):
-            try:
-                # Determine number of columns from the first line (cheap)
-                with open(gse_path, "r") as f:
-                    first = f.readline()
-                ncols = len(first.rstrip().split(",")) if first else 0
-                if ncols >= 2:
-                    usecols = tuple(range(1, ncols))  # skip node_index col
-                    X_gse = np.loadtxt(gse_path, delimiter=",", dtype=np.float32, usecols=usecols)
-                    if X_gse.ndim == 1:
-                        X_gse = X_gse.reshape(-1, 1)
-
-                    if X_gse.shape[0] != adata.n_obs:
-                        sysOps.throw_status("Warning: GSE coordinate array size does not match AnnData, mapping via explicit node_index column.")
-                        full = np.loadtxt(gse_path, delimiter=",", dtype=np.float32)
-                        idx = full[:, 0].astype(np.int64)
-                        coords = full[:, 1:].astype(np.float32)
-                        X_gse = np.full((adata.n_obs, coords.shape[1]), np.nan, dtype=np.float32)
-                        mask = (idx >= 0) & (idx < adata.n_obs)
-                        X_gse[idx[mask]] = coords[mask]
-
-                    gse_cols = [f"GSE_{i+1}" for i in range(X_gse.shape[1])]
-                    for i, col in enumerate(gse_cols):
-                        adata.obs[col] = X_gse[:, i]
-                    adata.obsm["X_gse"] = np.asarray(X_gse, dtype=np.float32)
-                    adata.uns["GSEoutput_source"] = os.path.basename(gse_path)
-            except Exception as e:
-                sysOps.throw_status("ERROR: could not attach GSEoutput to AnnData: " + str(e))
-                raise
-
-        # -------------------------
-        # Attach cluster labels
-        # -------------------------
-        if os.path.exists(cl_path):
-            try:
-                cl_raw = np.asarray(np.load(cl_path))
-                if cl_raw.ndim == 0:
-                    raise ValueError("cluster_labels.npy contained a scalar; expected (N,) or (N,K)")
-
-                # Normalize to 2D: (n_points, n_clusterings)
-                if cl_raw.ndim == 1:
-                    cl_mat = cl_raw.reshape(-1, 1)
-                elif cl_raw.ndim == 2:
-                    cl_mat = cl_raw
-
-                else:
-                    # Best-effort: preserve first axis as points, flatten the rest.
-                    cl_mat = cl_raw.reshape(cl_raw.shape[0], -1)
-
-                # If saved transposed (K, N), try to fix orientation against AnnData.
-                if cl_mat.shape[0] != adata.n_obs and cl_mat.shape[1] == adata.n_obs:
-                    cl_mat = cl_mat.T
-
-                mapped = None
-
-                # Direct attach when sizes match.
-                if cl_mat.shape[0] == adata.n_obs:
-                    mapped = np.asarray(cl_mat, dtype=np.int32)
-                else:
-                    # Attempt mapping via GSEoutput node_index (first column).
-
-                    if gse_path and os.path.exists(gse_path):
-                        idx = np.loadtxt(gse_path, delimiter=",", dtype=np.int64, usecols=0)
-
-                        # If labels are transposed relative to GSEoutput, fix that too.
-                        if idx.shape[0] != cl_mat.shape[0] and idx.shape[0] == cl_mat.shape[1]:
-                            cl_mat = cl_mat.T
-
-                        if idx.shape[0] == cl_mat.shape[0]:
-                            out = np.full((adata.n_obs, cl_mat.shape[1]), -1, dtype=np.int32)
-
-                            mask = (idx >= 0) & (idx < adata.n_obs)
-                            out[idx[mask], :] = np.asarray(cl_mat[mask, :], dtype=np.int32)
-                            mapped = out
-                        else:
-                            sysOps.throw_status(
-                                "Warning: cluster_labels.npy does not match AnnData, and its first dimension does not match GSEoutput; skipping."
-                            )
-                    else:
-                        sysOps.throw_status("Warning: cluster_labels.npy does not match AnnData and no GSEoutput present; skipping.")
-                if mapped is not None:
-                    n_cols = int(mapped.shape[1])
-                    # Naming policy:
-                    # - Legacy vector -> write 'cluster'
-                    # - Dual labels -> write method-specific names (no privileged default)
-                    if n_cols == 1:
-                        colnames = ["cluster"]
-                    elif n_cols == 2:
-                        colnames = ["cluster_hdbscan", "cluster_infomap"]
-                        adata.uns["cluster_labels_methods"] = ["hdbscan", "infomap"]
-                    elif n_cols == 3:
-                        colnames = [
-                            "cluster_hdbscan",
-                            "cluster_infomap",
-                            "cluster_infomap_final",
-                        ]
-                        adata.uns["cluster_labels_methods"] = [
-                            "hdbscan",
-                            "infomap",
-                            "infomap_final",
-                        ]
-                    elif n_cols == 4:
-                        colnames = [
-                            "cluster_hdbscan",
-                            "cluster_infomap",
-                            "cluster_infomap_final",
-                            "cluster_infomap_final_hybrid",
-                        ]
-                        adata.uns["cluster_labels_methods"] = [
-                            "hdbscan",
-                            "infomap",
-                            "infomap_final",
-                            "infomap_final_hybrid",
-                        ]
-                    else:
-                        colnames = [f"cluster_{i}" for i in range(n_cols)]
-
-
-                    for j, name in enumerate(colnames):
-                        adata.obs[name] = np.asarray(mapped[:, j], dtype=np.int32)
-
-                    adata.uns["cluster_labels_source"] = os.path.basename(cl_path)
-                    # Store as a plain list, not a tuple; some anndata/h5py stacks refuse
-                    # to serialize tuples in .uns and fail late during write_h5ad().
-                    adata.uns["cluster_labels_shape"] = [int(x) for x in mapped.shape]
-                    adata.uns["cluster_labels_columns"] = colnames
-
-            except Exception as e:
-                sysOps.throw_status("ERROR: could not attach cluster labels to AnnData: " + str(e))
-                raise
-
-        # -------------------------
-        # Write h5ad
-        # -------------------------
-        try:
-            import anndata as _anndata
-            if hasattr(_anndata, "settings") and hasattr(_anndata.settings, "allow_write_nullable_strings"):
-                _anndata.settings.allow_write_nullable_strings = True
-        except Exception:
-            pass
-
-        tmp_h5ad_out = h5ad_out + ".tmp"
-        try:
-            try:
-                if os.path.exists(tmp_h5ad_out):
-                    os.remove(tmp_h5ad_out)
-            except Exception:
-                pass
-
-            try:
-                adata.write_h5ad(tmp_h5ad_out, compression="gzip", compression_opts=4)
-            except TypeError:
-                adata.write_h5ad(tmp_h5ad_out)
-
-            os.replace(tmp_h5ad_out, h5ad_out)
-        except Exception:
-            try:
-                if os.path.exists(tmp_h5ad_out):
-                    os.remove(tmp_h5ad_out)
-            except Exception:
-                pass
-            raise
+        sysOps.throw_status("Loading initial AnnData from " + h5ad_out)
+        adata = _anndata.read_h5ad(h5ad_out)
+        _attach_gseoutput_to_adata(adata, gse_path)
+        _attach_cluster_labels_to_adata(adata, cl_path, gse_path=gse_path)
+        adata.uns['h5ad_build_stage'] = 'complete'
+        adata.uns['h5ad_annotation_only'] = False
+        _write_h5ad_atomic(adata, h5ad_out)
         sysOps.throw_status("Saved AnnData to " + h5ad_out)
-
     except Exception as e:
         sysOps.throw_status("ERROR: could not build/save one-hot AnnData: " + str(e))
         raise
+
 
 def _subset_index_key_by_keep_nodes(src_index_key_path: str, keep_nodes: np.ndarray) -> np.ndarray:
     """Subset a global index_key.npy onto keep_nodes while preserving (type, raw_index).
@@ -845,6 +1192,837 @@ def _ensure_trailing_slash(path_str):
     return path_str + '/'
 
 
+def _safe_load_json(path):
+    try:
+        with open(path, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _atomic_write_json(path, payload):
+    dirpath = os.path.dirname(os.path.abspath(path)) or "."
+    basename = os.path.basename(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=basename + ".tmp.", suffix=".json", dir=dirpath, text=True)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _atomic_save_npy(path, arr):
+    dirpath = os.path.dirname(os.path.abspath(path)) or "."
+    basename = os.path.basename(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=basename + ".tmp.", suffix=".npy", dir=dirpath)
+    os.close(fd)
+    try:
+        np.save(tmp_path, arr)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+
+@njit(parallel=True, cache=True)
+def _scale_csr_rows_inplace(indptr, data, scale):
+    """In-place CSR row scaling without materializing a sparse diagonal."""
+    n = indptr.shape[0] - 1
+    for i in prange(n):
+        s = scale[i]
+        for p in range(indptr[i], indptr[i + 1]):
+            data[p] *= s
+
+
+
+def _canonicalize_transport_component(W):
+    """Return a sorted, finite float64 CSR transport component with no diagonal."""
+    W = csr_matrix(W).astype(np.float64, copy=False).tocsr()
+    W.sum_duplicates()
+    W.setdiag(0.0)
+    W.eliminate_zeros()
+    if W.nnz:
+        finite = np.isfinite(W.data)
+        if not np.all(finite):
+            W.data[~finite] = 0.0
+            W.eliminate_zeros()
+    W.sort_indices()
+    return W
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _digest_arrays_hex(*arrays):
+    h = hashlib.blake2b(digest_size=16)
+    for arr in arrays:
+        a = np.ascontiguousarray(np.asarray(arr))
+        h.update(repr(tuple(a.shape)).encode("utf-8"))
+        h.update(str(a.dtype).encode("utf-8"))
+        if a.size > 0:
+            h.update(a.view(np.uint8).tobytes())
+    return h.hexdigest()
+
+
+def _load_npy_checkpoint(path, *, mmap_mode='r'):
+    try:
+        return np.load(path, mmap_mode=mmap_mode)
+    except Exception as e:
+        try:
+            sysOps.throw_status('Ignoring unreadable checkpoint ' + str(path) + ': ' + str(e))
+        except Exception:
+            pass
+        return None
+
+
+def _load_gseoutput_if_valid(path, expected_rows, expected_dim):
+    if not os.path.exists(path):
+        return None
+    try:
+        arr = np.loadtxt(path, delimiter=',', dtype=np.float64)
+    except Exception as e:
+        sysOps.throw_status('Ignoring unreadable GSEoutput checkpoint ' + str(path) + ': ' + str(e))
+        return None
+
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+
+    expected_rows = int(expected_rows)
+    expected_dim = int(expected_dim)
+    if arr.shape[0] != expected_rows or arr.shape[1] < (expected_dim + 1):
+        sysOps.throw_status(
+            'Ignoring incompatible GSEoutput checkpoint ' + str(path) +
+            ' with shape ' + str(arr.shape) + '; expected (' + str(expected_rows) + ', >= ' + str(expected_dim + 1) + ').'
+        )
+        return None
+
+    local_ids = arr[:, 0].astype(np.int64, copy=False)
+    if not np.array_equal(local_ids, np.arange(expected_rows, dtype=np.int64)):
+        sysOps.throw_status('Ignoring incompatible GSEoutput checkpoint ' + str(path) + ': node_index column is not 0..N-1.')
+        return None
+
+    return arr
+
+
+def _param_bool_flag(params, key, default=False):
+    """Parse a CLI/programmatic boolean flag without changing legacy callers."""
+    if params is None or key not in params:
+        return bool(default)
+    val = params.get(key)
+    if isinstance(val, list):
+        if len(val) == 0:
+            return True
+        val = val[0]
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return bool(default)
+    if isinstance(val, (int, np.integer, float, np.floating)):
+        return bool(val)
+    sval = str(val).strip().lower()
+    if sval in ('', '0', 'false', 'f', 'no', 'n', 'none', 'null', 'off'):
+        return False
+    return True
+
+
+def _param_first(params, key, default=None):
+    """Return a parsed/programmatic parameter value, unwrapping CLI lists."""
+    if params is None or key not in params:
+        return default
+    val = params.get(key, default)
+    if isinstance(val, list):
+        return val[0] if len(val) else default
+    return val
+
+
+
+
+_REGISTER_ZF_NONPUBLIC_PARAM_KEYS = {
+    '-register_zf_ensemble_seed',
+    '-register_zf_ensemble_mode',
+    '-register_zf_ensemble_tie_max',
+    '-register_zf_ensemble_perturb_units',
+    '-register_zf_ensemble_rel_tol',
+    '-register_zf_ensemble_abs_tol',
+    '-register_zf_ensemble_n_jobs',
+    '-register_zf_ensemble_threads_per_worker',
+    '-register_zf_ensemble_mp_start_method',
+    '-register_zf_pole_pairs_json',
+    '-register_zf_slice_capacity_mode',
+    '-register_zf_num_pole_pairs',
+    '-register_zf_genes_per_pole',
+    '-register_zf_anchor_mode',
+    '-register_zf_anchor_multimodal_sd_p95_norm_threshold',
+    '-register_zf_prior_mean_mode',
+}
+
+
+def _drop_nonpublic_register_zf_params(params):
+    """Drop implementation knobs from the ordinary CLI parameter surface.
+
+    Public register_zf choices are parsed explicitly in ``fill_params()``.
+    Remaining low-level choices are fixed internally or resolved from environment
+    variables and written to metadata rather than ``params.txt``.
+    """
+    if params is None:
+        return
+    for key in sorted(_REGISTER_ZF_NONPUBLIC_PARAM_KEYS):
+        if key in params:
+            try:
+                sysOps.throw_status('Ignoring non-public register_zf parameter ' + key + '; using fixed internal policy.')
+            except Exception:
+                pass
+            params.pop(key, None)
+
+
+def _env_first_int(names, default=None):
+    for name in names:
+        raw = os.getenv(str(name))
+        if raw is None or str(raw).strip() == '':
+            continue
+        try:
+            return int(str(raw).strip())
+        except Exception:
+            sysOps.throw_status('Warning: ignoring non-integer environment override ' + str(name) + '=' + str(raw))
+    return default
+
+
+def _env_first_str(names, default=None):
+    for name in names:
+        raw = os.getenv(str(name))
+        if raw is None:
+            continue
+        val = str(raw).strip()
+        if val:
+            return val
+    return default
+
+
+def _resolve_register_zf_ensemble_runtime(ensemble_size):
+    """Resolve hidden register_zf runtime controls without exposing params."""
+    threads_per_worker = _env_first_int(
+        ('REGISTER_ZF_ENSEMBLE_THREADS_PER_WORKER', 'REGZF_ENSEMBLE_THREADS_PER_WORKER'),
+        _REGISTER_ZF_ENSEMBLE_THREADS_PER_WORKER,
+    )
+    threads_per_worker = int(max(1, threads_per_worker or 1))
+
+    requested_jobs = _env_first_int(
+        ('REGISTER_ZF_ENSEMBLE_N_JOBS', 'REGZF_ENSEMBLE_N_JOBS'),
+        None,
+    )
+    if requested_jobs is None:
+        cpu_cap = int(max(1, int(getattr(sysOps, 'num_workers', NTHREADS)) // threads_per_worker))
+        requested_jobs = min(int(max(1, ensemble_size)), cpu_cap)
+    ensemble_n_jobs = int(max(1, requested_jobs))
+
+    mp_start_method = _env_first_str(
+        ('REGISTER_ZF_ENSEMBLE_MP_START_METHOD', 'REGZF_ENSEMBLE_MP_START_METHOD'),
+        None,
+    )
+    return ensemble_n_jobs, threads_per_worker, mp_start_method
+
+
+def _param_optional_str(params, key):
+    val = _param_first(params, key, None)
+    if val is None:
+        return None
+    sval = str(val).strip()
+    return sval if sval else None
+
+
+
+def _final_coarsen_align_enabled(params) -> bool:
+    """Return True for the deferred final Infomap coarsen + register_zf route."""
+    if params is None:
+        return False
+    return (params.get('-coarsen_infomap') is not None) and (_param_optional_str(params, '-register_zf') is not None)
+
+
+
+def _validate_coarsen_alignment_mode(params):
+    """Validate the deferred final coarsen-and-align route.
+
+    Plain non-coarsen runs are unchanged.  Coarsen without register_zf remains
+    unsupported, but the supported coarsen-and-align route no longer modifies
+    the second-pass GSE operator; register_zf is run only after final Infomap
+    clustering on the final embedding has completed.
+    """
+    if params is None:
+        return
+    coarsen_enabled = params.get('-coarsen_infomap') is not None
+    register_zf_flag = _param_optional_str(params, '-register_zf')
+    slice_path = _param_optional_str(params, '-slice_path')
+
+    if coarsen_enabled and register_zf_flag is None:
+        raise ValueError(
+            'coarsen-no-align mode has been removed.  Use ordinary non-coarsen '
+            'mode, or specify -coarsen_infomap together with -register_zf and -slice_path.'
+        )
+    if register_zf_flag is not None and not coarsen_enabled:
+        raise ValueError(
+            '-register_zf is only supported as part of coarsen-and-align; '
+            'also pass -coarsen_infomap, or remove -register_zf.'
+        )
+    if register_zf_flag is not None and slice_path is None:
+        raise ValueError('-register_zf requires -slice_path pointing to the raw slice h5ad.')
+    if coarsen_enabled and register_zf_flag is not None and params.get('-calc_final') is None:
+        raise ValueError(
+            '-coarsen_infomap + -register_zf now runs after final Infomap clustering and requires -calc_final '
+            'so the final annotated h5ad inputs are available for register_zf.'
+        )
+
+
+def _remove_removed_align_kernel_artifacts(path, output_name=None):
+    """Delete artifacts from the removed align-kernel/two-operator/coarsen-seed routes.
+
+    This is a cleanup guard only.  It prevents stale aligned transformed matrices,
+    stacked eigenbases, or coarse_fine_embedding seeds from changing the ordinary
+    v1-compatible scalar final solve.
+    """
+    path = _ensure_trailing_slash(str(path))
+    stale_solver_names = (
+        'transformed_matrix_inner_product.npz',
+        'transformed_matrix_simplex.npz',
+        'transformed_matrix.two_operator.meta.json',
+        'evecs.two_operator.meta.json',
+        'transformed_matrix.register_zf.meta.json',
+        'evecs_inner_product.npy',
+        'evals_inner_product.npy',
+        'evecs_simplex.npy',
+        'evals_simplex.npy',
+        'coarsen_spec_basis.npy',
+        'coarsen_spec_basis.meta.json',
+        'coarse_fine_embedding.npy',
+        'coarse_fine_embedding.meta.json',
+        'coarse_stack_scale_factor.npy',
+        'coarsen_stack_ready.meta.json',
+        # Legacy post-GSE/pre-GSE coarsen-align artifacts.  These are no
+        # longer allowed to affect the ordinary full_GSE route.
+        'coarsen_align_prior_refine.meta.json',
+        'coarsen_align_reference_registered.npz',
+        'coarsen_align_fine_node_mu_cov.npz',
+        'coarsen_align_fine_node_mu_cov.meta.json',
+        'orig_evecs_coarsen_align.npy',
+        'orig_evecs_coarsen_align.meta.json',
+        'orig_evecs_gapnorm_coarsen_align.npy',
+        'orig_evecs_gapnorm_coarsen_align.meta.json',
+        'orig_evecs_gapnorm_coarsen_align_stacked.npy',
+        'orig_evecs_gapnorm_coarsen_align_stacked.meta.json',
+        'transformed_matrix_coarsen_align.npz',
+        'coarsen_align_second_pass_operator.meta.json',
+    )
+    had_removed_solver_artifact = False
+    for name in stale_solver_names:
+        fpath = os.path.join(path, name)
+        if os.path.exists(fpath):
+            had_removed_solver_artifact = True
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+
+    if output_name is not None:
+        pre_refine_path = os.path.join(path, str(output_name) + '.pre_coarsen_align_prior')
+        if os.path.exists(pre_refine_path):
+            had_removed_solver_artifact = True
+            try:
+                os.remove(pre_refine_path)
+            except Exception:
+                pass
+
+    if had_removed_solver_artifact:
+        sysOps.throw_status(
+            'Removed stale align-kernel/two-operator/coarsen-seed artifacts; '
+            'forcing a v1-compatible scalar second-pass solve.'
+        )
+        for name in (
+            'transformed_matrix.npz',
+            'evecs.npy',
+            'evals.npy',
+            'init_evecs.npy',
+            'rank_evecs.npy',
+            'new_evecs.npy',
+            'preorthbasis.npy',
+        ):
+            fpath = os.path.join(path, name)
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+        _purge_final_resume_outputs(path, output_name=output_name)
+    return had_removed_solver_artifact
+
+def _npy_shape_safely(path):
+    try:
+        arr = np.load(path, mmap_mode='r')
+        return [int(x) for x in arr.shape]
+    except Exception:
+        return None
+
+
+def _file_stat_payload(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        st = os.stat(path)
+        return {
+            'path': os.path.basename(path),
+            'size': int(st.st_size),
+            'shape': _npy_shape_safely(path) if str(path).endswith('.npy') else None,
+        }
+    except Exception:
+        return None
+
+
+def _expected_register_zf_obs_dim(inference_dim):
+    """Number of slice-observed coordinate dimensions for register_zf alignment.
+
+    register_zf supplies raw slice coordinates only.  In the 3D coarse-alignment
+    route that means xy is observed and z must remain a separate graph-only block.
+    In a 2D run there is no latent coordinate, so both dimensions are observed.
+    """
+    d = int(inference_dim)
+    if d <= 0:
+        raise ValueError('inference_dim must be positive; got ' + str(inference_dim))
+    return d - 1 if d > 2 else d
+
+
+
+def _register_zf_ensemble_medoid_index(ens):
+    """Return the ensemble member closest to the ensemble in squared-distance medoid sense."""
+    ens = np.asarray(ens, dtype=np.float64)
+    if ens.ndim != 3 or ens.shape[0] <= 1:
+        return 0
+    E = int(ens.shape[0])
+    F = ens.reshape(E, -1)
+    G = F @ F.T
+    sq = np.sum(F * F, axis=1)
+    D2 = np.maximum(sq[:, None] + sq[None, :] - 2.0 * G, 0.0)
+    score = np.nanmean(D2, axis=1)
+    if not np.any(np.isfinite(score)):
+        return 0
+    return int(np.nanargmin(score))
+
+
+def _choose_register_zf_anchor_xy_from_ensemble(ens, *, a_to_slice_stack=None):
+    """Choose a concrete ensemble member for the saved exact slice-row witness.
+
+    The witness is always a real sparse-transport assignment.  The prior used
+    downstream is the ensemble mean and is computed separately.
+    """
+    ens = np.asarray(ens, dtype=np.float64)
+    if ens.ndim != 3:
+        raise ValueError('register_zf ensemble must have shape (E,M,obs_dim); got ' + str(ens.shape))
+
+    a_to_slice_stack_arr = None
+    if a_to_slice_stack is not None:
+        a_to_slice_stack_arr = np.asarray(a_to_slice_stack, dtype=np.int64)
+        if a_to_slice_stack_arr.ndim != 2 or a_to_slice_stack_arr.shape[:2] != ens.shape[:2]:
+            raise ValueError(
+                'register_zf a_to_slice stack has shape ' + str(a_to_slice_stack_arr.shape) +
+                '; expected ' + str(ens.shape[:2]) + '.'
+            )
+
+    if ens.shape[0] <= 1:
+        member_index = 0
+        coord_sd_mean = coord_sd_p95 = coord_sd_p95_norm = 0.0
+        medoid_idx = 0
+        used = 'single_member'
+    else:
+        coord_sd = np.sqrt(np.mean(np.var(ens, axis=0, ddof=1), axis=1))
+        flat = ens.reshape(-1, ens.shape[2])
+        span = float(LA.norm(np.ptp(flat, axis=0)))
+        if (not np.isfinite(span)) or span <= 1.0e-12:
+            span = 1.0
+        coord_sd_mean = float(np.nanmean(coord_sd)) if coord_sd.size else 0.0
+        coord_sd_p95 = float(np.nanquantile(coord_sd, 0.95)) if coord_sd.size else 0.0
+        coord_sd_p95_norm = float(coord_sd_p95 / max(span, 1.0e-12))
+        medoid_idx = _register_zf_ensemble_medoid_index(ens)
+        member_index = int(medoid_idx)
+        used = 'medoid_member'
+
+    selected_slice_indices = None
+    if a_to_slice_stack_arr is not None:
+        selected_slice_indices = np.asarray(a_to_slice_stack_arr[int(member_index)], dtype=np.int64)
+
+    meta = {
+        'anchor_coord_mode_used': used,
+        'anchor_member_index': int(member_index),
+        'anchor_is_exact_slice_member': True,
+        'anchor_slice_indices_available': bool(selected_slice_indices is not None),
+        'prior_mean_semantics': 'ensemble_mean_not_anchor_witness',
+        'ensemble_coord_sd_mean': float(coord_sd_mean),
+        'ensemble_coord_sd_p95': float(coord_sd_p95),
+        'ensemble_coord_sd_p95_norm': float(coord_sd_p95_norm),
+        'ensemble_medoid_member_index': int(medoid_idx),
+    }
+    return np.asarray(ens[int(member_index)], dtype=np.float64), meta, selected_slice_indices
+
+
+def _save_register_zf_visualization_artifacts(
+    *,
+    gdp,
+    coarse_registered_xy_ensemble,
+    anchor_prior_coords,
+    anchor_gse_coords,
+    register_zf_payload,
+    register_zf_resolved_config,
+    inference_dim,
+    obs_dim,
+):
+    """Persist register_zf witness/prior files for visualization/provenance.
+
+    In the patched route these files live under final_coarsening/ and document
+    the coarsened aggregate-node registration ensemble.  They are not consumed
+    by full_GSE and are not lifted back to fine nodes.
+    """
+    gdp = _ensure_trailing_slash(str(gdp))
+    ens = np.asarray(coarse_registered_xy_ensemble, dtype=np.float64)
+    if ens.ndim != 3:
+        raise ValueError('coarse_registered_xy_ensemble must have shape (E,M,obs_dim); got ' + str(ens.shape))
+    obs_dim = int(obs_dim)
+    inference_dim = int(inference_dim)
+    a_to_slice_stack = register_zf_payload.get('a_to_slice') if isinstance(register_zf_payload, dict) else None
+    witness_xy, anchor_meta, selected_slice_indices = _choose_register_zf_anchor_xy_from_ensemble(
+        ens,
+        a_to_slice_stack=a_to_slice_stack,
+    )
+    prior_mean_xy = np.mean(ens, axis=0)
+    prior_meta = {
+        'prior_mean_mode_used': 'ensemble_mean',
+        'prior_mean_is_exact_slice_member': False,
+    }
+
+    anchor_prior_coords = np.asarray(anchor_prior_coords, dtype=np.float64)
+    anchor_gse_coords = np.asarray(anchor_gse_coords, dtype=np.float64)
+    if anchor_prior_coords.ndim != 2 or anchor_gse_coords.ndim != 2:
+        raise ValueError('anchor_prior_coords and anchor_gse_coords must both be 2D arrays.')
+    if anchor_prior_coords.shape != anchor_gse_coords.shape:
+        raise ValueError(
+            'anchor_prior_coords shape ' + str(anchor_prior_coords.shape) +
+            ' does not match anchor_gse_coords shape ' + str(anchor_gse_coords.shape) + '.'
+        )
+    if anchor_prior_coords.shape[1] < inference_dim:
+        raise ValueError('anchor coordinate arrays have fewer columns than inference_dim.')
+
+    anchor_witness_coords = np.asarray(anchor_gse_coords, dtype=np.float64).copy()
+    anchor_witness_coords[:, :obs_dim] = np.asarray(witness_xy, dtype=np.float64)
+
+    np.save(os.path.join(gdp, 'coarse_anchor_coords_prior_mean.npy'), anchor_prior_coords)
+    np.save(os.path.join(gdp, 'coarse_anchor_coords_witness.npy'), anchor_witness_coords)
+    np.save(os.path.join(gdp, 'coarse_anchor_coords_registered.npy'), anchor_witness_coords)
+
+    anchor_slice_indices_path = os.path.join(gdp, 'coarse_anchor_slice_indices.npy')
+    if selected_slice_indices is not None:
+        selected_slice_indices = np.asarray(selected_slice_indices, dtype=np.int64)
+        if selected_slice_indices.shape[0] != anchor_witness_coords.shape[0]:
+            raise ValueError(
+                'coarse anchor slice-index witness length ' + str(selected_slice_indices.shape[0]) +
+                ' does not match anchor row count ' + str(anchor_witness_coords.shape[0]) + '.'
+            )
+        np.save(anchor_slice_indices_path, selected_slice_indices)
+    elif os.path.exists(anchor_slice_indices_path):
+        try:
+            os.remove(anchor_slice_indices_path)
+        except Exception:
+            pass
+
+    _atomic_write_json(
+        os.path.join(gdp, 'coarse_anchor_coords_registered.meta.json'),
+        {
+            'layout_version': 3,
+            'source': 'register_zf visualization/provenance artifacts',
+            'solver_path': 'final Infomap clustering -> final_coarsening aggregate h5ad -> register_zf',
+            'coords_frame': 'raw_slice_spatial_xy_for_observed_block',
+            'obs_dim': int(obs_dim),
+            'inference_dim': int(inference_dim),
+            'prior_mean_path': 'coarse_anchor_coords_prior_mean.npy',
+            'witness_path': 'coarse_anchor_coords_witness.npy',
+            'registered_alias_of': 'coarse_anchor_coords_witness.npy',
+            'coarse_anchor_coords_semantics': 'ensemble_prior_mean_on_final_coarsened_nodes',
+            'unregistered_gse_path': 'coarse_anchor_coords_final_gse.npy',
+            'register_zf_output_dir': None if register_zf_payload is None else register_zf_payload.get('output_dir'),
+            'register_zf_ensemble_npz_path': None if register_zf_payload is None else register_zf_payload.get('ensemble_npz_path'),
+            'register_zf_anchor_slice_indices_path': (
+                os.path.basename(anchor_slice_indices_path)
+                if selected_slice_indices is not None
+                else None
+            ),
+            'anchor_selection': anchor_meta,
+            'prior_selection': prior_meta,
+            'resolved_internal_config': register_zf_resolved_config,
+            'no_fine_lift': True,
+        },
+    )
+    return {
+        'anchor_selection': anchor_meta,
+        'prior_selection': prior_meta,
+        'anchor_slice_indices_available': bool(selected_slice_indices is not None),
+        'no_fine_lift': True,
+    }
+
+
+
+
+def _regularize_covariance_stack(cov_stack, *, cov_floor):
+    """Symmetrize and add a small isotropic floor to a stack of tiny covariances."""
+    cov_stack = np.asarray(cov_stack, dtype=np.float64)
+    if cov_stack.ndim != 3 or cov_stack.shape[1] != cov_stack.shape[2]:
+        raise ValueError('cov_stack must have shape (n,b,b); got ' + str(cov_stack.shape))
+    n, b, _ = cov_stack.shape
+    cov_reg = np.array(0.5 * (cov_stack + np.swapaxes(cov_stack, 1, 2)), dtype=np.float64, copy=True)
+    bad = ~np.isfinite(cov_reg).all(axis=(1, 2))
+    if np.any(bad):
+        cov_reg[bad, :, :] = 0.0
+    traces = np.trace(cov_reg, axis1=1, axis2=2)
+    good = traces[np.isfinite(traces) & (traces > 0.0)] / float(max(1, b))
+    scale = float(np.median(good)) if good.size else 1.0
+    if (not np.isfinite(scale)) or scale <= 0.0:
+        scale = 1.0
+    floor_abs = max(float(cov_floor) * scale, 1.0e-12)
+    diag = np.arange(b, dtype=np.int64)
+    cov_reg[:, diag, diag] += float(floor_abs)
+    return cov_reg, float(floor_abs)
+
+
+def _coarse_node_moments_from_register_ensemble(
+    coarse_registered_xy_ensemble,
+    anchor_placement_coords,
+    *,
+    inference_dim,
+    cov_floor,
+):
+    """Compute coarse-node mu/cov moments from the register_zf ensemble.
+
+    The returned moments are deliberately in the final-coarsened node frame;
+    no fine-node lift or fine-to-coarse transport is constructed.
+    """
+    ens = np.asarray(coarse_registered_xy_ensemble, dtype=np.float64)
+    if ens.ndim != 3:
+        raise ValueError('register_zf ensemble must have shape (E,M,obs_dim); got ' + str(ens.shape))
+    E, M, obs_dim_raw = ens.shape
+    d = int(inference_dim)
+    obs_dim = _expected_register_zf_obs_dim(d)
+    if int(obs_dim_raw) != int(obs_dim):
+        raise ValueError(
+            'register_zf ensemble returned ' + str(obs_dim_raw) +
+            ' observed dimensions; inference_dim=' + str(d) +
+            ' expects ' + str(obs_dim) + '.'
+        )
+
+    mu_obs = np.mean(ens[:, :, :obs_dim], axis=0)
+    cov_obs = np.zeros((int(M), int(obs_dim), int(obs_dim)), dtype=np.float64)
+    if E > 1:
+        for e in range(int(E)):
+            delta = ens[e, :, :obs_dim] - mu_obs
+            cov_obs += np.einsum('ni,nj->nij', delta, delta, optimize=True)
+        cov_obs /= float(E - 1)
+    cov_obs, floor_abs = _regularize_covariance_stack(cov_obs, cov_floor=float(cov_floor))
+
+    anchor = np.asarray(anchor_placement_coords, dtype=np.float64)
+    mu = np.zeros((int(M), int(d)), dtype=np.float64)
+    mu[:, :obs_dim] = mu_obs
+    if d > obs_dim and anchor.ndim == 2 and anchor.shape[0] == M:
+        use = min(d - obs_dim, max(0, anchor.shape[1] - obs_dim))
+        if use > 0:
+            mu[:, obs_dim:obs_dim + use] = anchor[:, obs_dim:obs_dim + use]
+
+    return {
+        'mu': mu,
+        'cov_observed': cov_obs,
+        'obs_dim': int(obs_dim),
+        'cov_floor_abs': float(floor_abs),
+    }
+
+
+def _write_coarse_node_moments_file(*, out_root, moments, register_zf_resolved_config=None, register_zf_payload=None):
+    """Persist coarse-node register_zf moments in final_coarsening/."""
+    out_root = _ensure_trailing_slash(str(out_root))
+    mu = np.asarray(moments['mu'], dtype=np.float64)
+    cov_observed = np.asarray(moments['cov_observed'], dtype=np.float64)
+    obs_dim = int(moments.get('obs_dim', cov_observed.shape[1]))
+    if mu.ndim != 2:
+        raise ValueError('coarse-node moments require 2D mu; got ' + str(mu.shape))
+    if cov_observed.ndim != 3 or cov_observed.shape[0] != mu.shape[0]:
+        raise ValueError('coarse-node cov_observed shape ' + str(cov_observed.shape) + ' is incompatible with mu shape ' + str(mu.shape))
+
+    out_path = os.path.join(out_root, _REGISTER_ZF_COARSE_MOMENTS_FILENAME)
+    tmp_path = out_path + '.tmp.npz'
+    meta_path = os.path.join(out_root, _REGISTER_ZF_COARSE_MOMENTS_META_FILENAME)
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        pass
+
+    np.savez(
+        tmp_path,
+        mu=mu,
+        cov=cov_observed,
+        cov_observed=cov_observed,
+        obs_dim=np.asarray([obs_dim], dtype=np.int64),
+        inference_dim=np.asarray([int(mu.shape[1])], dtype=np.int64),
+        cov_floor_abs=np.asarray([float(moments.get('cov_floor_abs', np.nan))], dtype=np.float64),
+    )
+    os.replace(tmp_path, out_path)
+
+    _atomic_write_json(
+        meta_path,
+        {
+            'layout_version': 1,
+            'mode': 'final_coarsened_register_zf_moments',
+            'file': os.path.basename(out_path),
+            'semantics': 'coarse-node centroids and observed-slice covariance from register_zf ensemble on the final-Infomap coarsened graph; not lifted to fine nodes and not consumed by full_GSE',
+            'Npts': int(mu.shape[0]),
+            'inference_dim': int(mu.shape[1]),
+            'obs_dim': int(obs_dim),
+            'cov_key': 'cov_observed',
+            'cov_shape': [int(x) for x in cov_observed.shape],
+            'mu_shape': [int(x) for x in mu.shape],
+            'cov_floor_abs': float(moments.get('cov_floor_abs', np.nan)),
+            'register_zf_output_dir': None if register_zf_payload is None else register_zf_payload.get('output_dir'),
+            'register_zf_ensemble_npz_path': None if register_zf_payload is None else register_zf_payload.get('ensemble_npz_path'),
+            'resolved_internal_config': register_zf_resolved_config,
+            'no_fine_lift': True,
+        },
+    )
+    return out_path, meta_path
+
+
+def _copy_register_zf_coarse_alignment_aliases(out_root, register_zf_payload):
+    """Copy register_zf aggregate-node outputs into final_coarsening/ with coarse-node names."""
+    out_root = _ensure_trailing_slash(str(out_root))
+    if not isinstance(register_zf_payload, dict):
+        return {}
+    reg_out = register_zf_payload.get('output_dir')
+    if not reg_out:
+        return {}
+    reg_out = str(reg_out)
+    aliases = {
+        'aggregated_to_slice_match_csr.npz': 'coarse_node_to_slice_match_csr.npz',
+        'slice_to_aggregated_match_csr.npz': 'slice_to_coarse_node_match_csr.npz',
+        'aggregated_nodes_slice_mapped_coords.npz': 'coarse_nodes_slice_mapped_coords.npz',
+        'aggregated_nodes_slice_mapped_coords_ensemble.npz': 'coarse_nodes_slice_mapped_coords_ensemble.npz',
+        'slice_assigned_aggregated_feature_maps.npz': 'slice_assigned_coarse_node_feature_maps.npz',
+        'matching_context_base.npz': 'coarse_matching_context_base.npz',
+        'matching_refinement_context.npz': 'coarse_matching_refinement_context.npz',
+        'slice_capacity_targets.npz': 'coarse_slice_capacity_targets.npz',
+        'slice_capacity_spatial_diagnostics.json': 'coarse_slice_capacity_spatial_diagnostics.json',
+        'run_metadata.json': 'coarse_register_zf_run_metadata.json',
+        'ensemble_metadata.json': 'coarse_register_zf_ensemble_metadata.json',
+    }
+    copied = {}
+    for src_name, dst_name in aliases.items():
+        src = os.path.join(reg_out, src_name)
+        if os.path.exists(src):
+            dst = os.path.join(out_root, dst_name)
+            try:
+                shutil.copyfile(src, dst)
+                copied[src_name] = dst_name
+            except Exception as e:
+                sysOps.throw_status('Warning: could not copy register_zf alias ' + src + ' -> ' + dst + ': ' + str(e))
+    return copied
+
+def _remove_register_zf_visualization_artifacts(gdp):
+    gdp = _ensure_trailing_slash(str(gdp))
+    for stale_name in (
+        'coarse_anchor_coords_registered.npy',
+        'coarse_anchor_coords_registered.meta.json',
+        'coarse_anchor_coords_prior_mean.npy',
+        'coarse_anchor_coords_witness.npy',
+        'coarse_anchor_slice_indices.npy',
+    ):
+        stale_path = os.path.join(gdp, stale_name)
+        if os.path.exists(stale_path):
+            try:
+                os.remove(stale_path)
+            except Exception:
+                pass
+
+
+
+
+
+
+def _coarse_anchor_search_meta(source_digest, n_rows, n_cols):
+    return {
+        'layout_version': 2,
+        'source_digest': str(source_digest),
+        'n_rows': int(n_rows),
+        'n_cols': int(n_cols),
+    }
+
+
+def _purge_final_resume_outputs(path, output_name=None):
+    import glob
+
+    targets = [
+        'sample_Xpts.npy',
+        'cluster_labels.npy',
+        'cluster_labels_meta.json',
+        'GSEoutput_meta.json',
+    ]
+    if output_name is not None:
+        targets.append(str(output_name))
+        iter_pattern = 'iter*_' + str(output_name)
+    else:
+        iter_pattern = 'iter*_GSEoutput.txt'
+
+    for name in targets:
+        fpath = os.path.join(path, name)
+        if os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+
+    for fpath in glob.glob(os.path.join(path, iter_pattern)):
+        try:
+            os.remove(fpath)
+        except Exception:
+            pass
+
+    for fpath in glob.glob(os.path.join(path, 'transformed_matrix_final_*.npz')):
+        try:
+            os.remove(fpath)
+        except Exception:
+            pass
+
+
+
+
+
+
+
+
+
+
+
+
+
 def _build_knn_indicator_csr(nn_indices, shape):
     """Build a CSR indicator matrix from an (N x k) integer neighbor index array without a large row-repeat."""
     nn_indices = np.asarray(nn_indices)
@@ -868,236 +2046,658 @@ def _build_transformed_matrix_from_coords(sym_link_csr, coords, kneighbors, out_
     P.eliminate_zeros()
     P = (P + P.T) * 0.5 
     save_npz(out_npz_path, P)
+    del nn_indices, nn_indices_csr, P
 
 
-def _load_gse_coords_aligned(gse_path: str, n_nodes: int) -> np.ndarray:
-    """Load GSEoutput-like coordinates and align rows by explicit node_index if needed."""
-    coords_df = pd.read_csv(gse_path, header=None)
-    if coords_df.shape[1] < 2:
-        raise ValueError(f"Expected at least 2 columns in {gse_path}, found {coords_df.shape[1]}")
-
-    node_ids = coords_df.iloc[:, 0].to_numpy(dtype=np.int64, copy=False)
-    coords = coords_df.iloc[:, 1:].to_numpy(dtype=np.float32, copy=False)
-    del coords_df
-
-    if coords.shape[0] == int(n_nodes):
-        expected = np.arange(int(n_nodes), dtype=np.int64)
-        if np.array_equal(node_ids, expected):
-            return coords
-
-    aligned = np.full((int(n_nodes), int(coords.shape[1])), np.nan, dtype=np.float32)
-    valid = (node_ids >= 0) & (node_ids < int(n_nodes))
-    aligned[node_ids[valid]] = coords[valid]
-    if np.any(~np.isfinite(aligned)):
-        bad_rows = int(np.sum(~np.isfinite(aligned).all(axis=1)))
-        raise ValueError(f"Could not align {gse_path} to {n_nodes} nodes; missing rows = {bad_rows}")
-    return aligned
+def _fill_nonfinite_columns(arr):
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError('Expected a 2D coordinate array; got ' + str(arr.shape))
+    out = np.array(arr, dtype=np.float64, copy=True)
+    if not np.all(np.isfinite(out)):
+        for j in range(out.shape[1]):
+            col = out[:, j]
+            good = np.isfinite(col)
+            fill = float(np.mean(col[good])) if np.any(good) else 0.0
+            col[~good] = fill
+            out[:, j] = col
+    return out
 
 
-def _edge_distances_from_coords(coords: np.ndarray, row: np.ndarray, col: np.ndarray,
-                                chunk_size: int = _FILTER_DISTANCE_CHUNK) -> np.ndarray:
-    """Compute Euclidean edge lengths in chunks to limit peak memory."""
-    n_edges = int(row.size)
-    dists = np.empty(n_edges, dtype=np.float32)
-    chunk_size = max(1, int(chunk_size))
-
-    for start in range(0, n_edges, chunk_size):
-        stop = min(start + chunk_size, n_edges)
-        delta = coords[row[start:stop]] - coords[col[start:stop]]
-        sq = np.einsum('ij,ij->i', delta, delta, dtype=np.float64, optimize=True)
-        np.sqrt(sq, out=sq)
-        dists[start:stop] = sq.astype(np.float32, copy=False)
-
-    return dists
-
-
-def _smoothed_source_nn_scale(n_nodes: int,
-                              row: np.ndarray,
-                              col: np.ndarray,
-                              dists: np.ndarray) -> np.ndarray:
-    """Graph-smoothed local distance scale built from nodewise nearest-neighbor lengths.
-
-    The raw per-node scale is the minimum incident edge length on the implicit
-    undirected graph. We then take a one-step closed-neighborhood mean to reduce
-    variance, and finally floor the result against the graph-wide typical scale
-    so very tight local clusters do not create pathological denominators.
-    """
-    dist64 = np.asarray(dists, dtype=np.float64)
-    raw_nn = np.full(int(n_nodes), np.inf, dtype=np.float64)
-    np.minimum.at(raw_nn, row, dist64)
-    np.minimum.at(raw_nn, col, dist64)
-
-    valid = np.isfinite(raw_nn)
-    if np.any(valid):
-        global_nn = float(np.median(raw_nn[valid]))
+def _approx_median_pairwise_distance(coords, *, max_points=2048):
+    coords = np.asarray(coords, dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[0] < 2 or coords.shape[1] < 1:
+        return 1.0
+    n = int(coords.shape[0])
+    m = min(int(max_points), n)
+    if m < n:
+        idx = np.linspace(0, n - 1, m, dtype=np.int64)
+        X = np.asarray(coords[idx], dtype=np.float64)
     else:
-        global_nn = 1.0
-    raw_nn[~valid] = global_nn
+        X = np.asarray(coords, dtype=np.float64)
+    X = _fill_nonfinite_columns(X)
+    sq = np.sum(X * X, axis=1)
+    D2 = sq[:, None] + sq[None, :] - 2.0 * (X @ X.T)
+    D2 = np.maximum(D2, 0.0)
+    tri = np.triu_indices(int(X.shape[0]), k=1)
+    vals = np.sqrt(D2[tri])
+    vals = vals[np.isfinite(vals) & (vals > 1.0e-12)]
+    if vals.size == 0:
+        return 1.0
+    med = float(np.median(vals))
+    return med if np.isfinite(med) and med > 1.0e-12 else 1.0
 
-    deg = np.bincount(row, minlength=int(n_nodes)).astype(np.float64, copy=False)
-    deg += np.bincount(col, minlength=int(n_nodes))
-
-    nbr_sum = np.bincount(row, weights=raw_nn[col], minlength=int(n_nodes)).astype(np.float64, copy=False)
-    nbr_sum += np.bincount(col, weights=raw_nn[row], minlength=int(n_nodes))
-
-    smooth = (raw_nn + nbr_sum) / np.maximum(1.0, 1.0 + deg)
-    denom_floor = max(1e-6, 0.1 * global_nn)
-    return np.maximum(smooth, denom_floor)
 
 
-def _incident_edge_ratio_stats(n_nodes: int,
-                               row: np.ndarray,
-                               col: np.ndarray,
-                               dists: np.ndarray,
-                               edge_weights: np.ndarray,
-                               source_scale: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Weighted incident mean/std of directed distance-to-local-scale ratios."""
-    wt = np.asarray(edge_weights, dtype=np.float64)
-    dist64 = np.asarray(dists, dtype=np.float64)
-    scale = np.asarray(source_scale, dtype=np.float64)
-
-    ratio_row = dist64 / np.maximum(scale[row], 1e-12)
-    ratio_col = dist64 / np.maximum(scale[col], 1e-12)
-
-    sum_w = np.bincount(row, weights=wt, minlength=int(n_nodes)).astype(np.float64, copy=False)
-    sum_w += np.bincount(col, weights=wt, minlength=int(n_nodes))
-
-    wr_row = wt * ratio_row
-    wr_col = wt * ratio_col
-    sum_r = np.bincount(row, weights=wr_row, minlength=int(n_nodes)).astype(np.float64, copy=False)
-    sum_r += np.bincount(col, weights=wr_col, minlength=int(n_nodes))
-
-    sum_r2 = np.bincount(row, weights=wr_row * ratio_row, minlength=int(n_nodes)).astype(np.float64, copy=False)
-    sum_r2 += np.bincount(col, weights=wr_col * ratio_col, minlength=int(n_nodes))
-
-    denom = np.maximum(sum_w, 1e-12)
-    mu = sum_r / denom
-    var = np.maximum(0.0, (sum_r2 / denom) - (mu * mu))
-    sigma = np.sqrt(var)
-
-    valid = sum_w > 0
-    if np.any(valid):
-        global_mu = float(np.median(mu[valid]))
-        global_sigma = float(np.median(sigma[valid]))
+def _robust_column_scale_median(coords):
+    """Median robust per-column scale, with finite fallback, for candidate kNN only."""
+    X = _fill_nonfinite_columns(coords)
+    if X.ndim != 2 or X.shape[0] < 2 or X.shape[1] < 1:
+        return 1.0
+    med = np.median(X, axis=0)
+    mad = 1.4826 * np.median(np.abs(X - med[None, :]), axis=0)
+    good = mad[np.isfinite(mad) & (mad > 1.0e-12)]
+    if good.size:
+        scale = float(np.median(good))
     else:
-        global_mu = 1.0
-        global_sigma = 0.0
-
-    sigma_floor = max(1e-6, 0.1 * global_sigma, 1e-3 * global_mu)
-    sigma = np.maximum(sigma, sigma_floor)
-    return ratio_row, ratio_col, mu, sigma
+        sd = np.std(X, axis=0)
+        good = sd[np.isfinite(sd) & (sd > 1.0e-12)]
+        scale = float(np.median(good)) if good.size else 1.0
+    return scale if np.isfinite(scale) and scale > 1.0e-12 else 1.0
 
 
-def _export_filtered_subgraph_from_gse(base_path: str,
-                                       output_name: str,
-                                       *,
-                                       filtered_dirname: str = "filtered",
-                                       z_thresh: float = _FILTER_EDGE_ZSCORE) -> str:
-    """Export a connectivity-trimmed induced subgraph into <base_path>/filtered/."""
-    base_path = _ensure_trailing_slash(str(base_path))
-    gse_path = os.path.join(base_path, str(output_name))
-    link_path = os.path.join(base_path, "link_assoc_reindexed.npz")
-    index_key_path = os.path.join(base_path, "index_key.npy")
+def _digest_arrays_hex_streaming(*arrays, chunk_rows=262144):
+    """Content hash like _digest_arrays_hex, but without large full-array copies."""
+    h = hashlib.blake2b(digest_size=16)
+    for arr in arrays:
+        if isinstance(arr, (bytes, bytearray)):
+            h.update(b'raw-bytes')
+            h.update(len(arr).to_bytes(8, byteorder='little', signed=False))
+            h.update(bytes(arr))
+            continue
+        a = np.asarray(arr)
+        h.update(repr(tuple(a.shape)).encode('utf-8'))
+        h.update(str(a.dtype).encode('utf-8'))
+        if a.size == 0:
+            continue
+        if a.ndim >= 1 and int(a.shape[0]) > int(chunk_rows):
+            for s in range(0, int(a.shape[0]), int(chunk_rows)):
+                e = min(int(a.shape[0]), s + int(chunk_rows))
+                c = np.ascontiguousarray(a[s:e])
+                h.update(c.view(np.uint8).tobytes())
+        else:
+            c = np.ascontiguousarray(a)
+            h.update(c.view(np.uint8).tobytes())
+    return h.hexdigest()
 
-    if not os.path.exists(gse_path):
-        raise FileNotFoundError(f"Could not find embedding output for filtering: {gse_path}")
-    if not os.path.exists(link_path):
-        raise FileNotFoundError(f"Could not find graph for filtering: {link_path}")
-    if not os.path.exists(index_key_path):
-        raise FileNotFoundError(f"Could not find index key for filtering: {index_key_path}")
 
-    link_triu = load_npz(link_path).tocsr()
-    link_triu.sum_duplicates()
-    link_triu.eliminate_zeros()
-    n_nodes = int(link_triu.shape[0])
-    if n_nodes <= 0:
-        raise ValueError("Cannot filter an empty graph.")
+def _sparse_weight_sum_csr(mat):
+    """Return the raw total sparse edge weight of a CSR-like matrix."""
+    mat = mat.tocsr()
+    if mat.nnz == 0:
+        return 0.0
+    return float(np.asarray(mat.data, dtype=np.float64).sum())
 
-    coords = _load_gse_coords_aligned(gse_path, n_nodes)
-    link_coo = link_triu.tocoo(copy=False)
-    row = np.asarray(link_coo.row, dtype=np.int64)
-    col = np.asarray(link_coo.col, dtype=np.int64)
-    data = np.asarray(link_coo.data, dtype=np.float64)
 
-    dists = _edge_distances_from_coords(coords, row, col)
-    source_scale = _smoothed_source_nn_scale(n_nodes, row, col, dists)
-    ratio_row, ratio_col, mu_ratio, sigma_ratio = _incident_edge_ratio_stats(
-        n_nodes, row, col, dists, data, source_scale
-    )
-    retain_mask = (
-        (ratio_row <= (mu_ratio[row] + float(z_thresh) * sigma_ratio[row])) &
-        (ratio_col <= (mu_ratio[col] + float(z_thresh) * sigma_ratio[col]))
-    )
-    if not np.any(retain_mask):
-        sysOps.throw_status("Warning: filter removed all edges; falling back to the original graph.")
-        retain_mask = np.ones(row.shape[0], dtype=np.bool_)
 
-    retain_graph = csr_matrix(
-        (np.ones(int(np.sum(retain_mask)), dtype=np.int8), (row[retain_mask], col[retain_mask])),
-        shape=(n_nodes, n_nodes),
-    )
-    retain_graph = retain_graph + retain_graph.T
 
-    n_components, labels = connected_components(retain_graph, directed=False, return_labels=True)
-    comp_sizes = np.bincount(labels, minlength=max(1, int(n_components)))
-    keep_label = int(np.argmax(comp_sizes))
-    keep_node_mask = (labels == keep_label)
-    keep_nodes = np.flatnonzero(keep_node_mask).astype(np.int64, copy=False)
 
-    edge_keep = retain_mask & keep_node_mask[row] & keep_node_mask[col]
-    if keep_nodes.size == 0 or (not np.any(edge_keep)):
-        sysOps.throw_status("Warning: filtered graph became empty; falling back to the original graph.")
-        keep_nodes = np.arange(n_nodes, dtype=np.int64)
-        edge_keep = np.ones(row.shape[0], dtype=np.bool_)
 
-    new_ids = np.full(n_nodes, -1, dtype=np.int64)
-    new_ids[keep_nodes] = np.arange(keep_nodes.size, dtype=np.int64)
 
-    filtered_graph = csr_matrix(
-        (data[edge_keep], (new_ids[row[edge_keep]], new_ids[col[edge_keep]])),
-        shape=(int(keep_nodes.size), int(keep_nodes.size)),
-    )
-    filtered_graph.sum_duplicates()
-    filtered_graph.eliminate_zeros()
 
-    filtered_path = _ensure_trailing_slash(os.path.join(base_path, filtered_dirname))
-    os.makedirs(filtered_path, exist_ok=True)
-    # Always clear stale derived artifacts so the child rerun cannot reuse
-    # eigensystems/transformed matrices built for a previous filtered export.
-    sysOps.prune_dir_except([], path=filtered_path)
 
-    np.save(os.path.join(filtered_path, "keep_nodes_global.npy"), keep_nodes)
-    np.save(
-        os.path.join(filtered_path, "index_key.npy"),
-        np.asarray(_subset_index_key_by_keep_nodes(index_key_path, keep_nodes), dtype=np.int64),
-    )
-    save_npz(
-        os.path.join(filtered_path, "link_assoc_reindexed.npz"),
-        scipy.sparse.triu(filtered_graph, format='csr'),
-    )
 
-    stats = {
-        "z_threshold": float(z_thresh),
-        "ratio_scale_median": float(np.median(source_scale)) if source_scale.size else 0.0,
-        "ratio_mu_median": float(np.median(mu_ratio)) if mu_ratio.size else 0.0,
-        "n_nodes_input": int(n_nodes),
-        "n_edges_input": int(row.size),
-        "n_edges_retained": int(np.sum(edge_keep)),
-        "n_nodes_retained": int(keep_nodes.size),
-        "node_fraction_retained": float(keep_nodes.size / max(1, n_nodes)),
-        "edge_fraction_retained": float(np.sum(edge_keep) / max(1, row.size)),
-        "n_components_after_truncation": int(n_components),
-        "largest_component_size": int(comp_sizes[keep_label]),
+
+
+
+
+
+
+def _build_membership_csr(node2super, M, dtype=np.float64):
+    """Build an (N x M) CSR membership matrix C with C[i, node2super[i]] = 1."""
+    node2super = np.asarray(node2super)
+    N = node2super.shape[0]
+    valid = node2super >= 0
+
+    indptr = np.empty(N + 1, dtype=np.int64)
+    indptr[0] = 0
+    indptr[1:] = np.cumsum(valid.astype(np.int64))
+
+    indices = node2super[valid].astype(np.int64, copy=False)
+    data = np.ones(indices.shape[0], dtype=dtype)
+    return csr_matrix((data, indices, indptr), shape=(N, M))
+
+
+def _coarsen_sparse_by_mapping_matmul(W_csr, node2super, M, remove_diagonal=True):
+    """Coarsen a sparse matrix W using quotient construction C^T W C."""
+    C = _build_membership_csr(node2super, M)
+    Wc = (C.T @ W_csr @ C).tocsr()
+    if remove_diagonal:
+        Wc.setdiag(0)
+        Wc.eliminate_zeros()
+    return Wc
+
+
+def _build_supernodes_from_labels(labels, min_cluster_size):
+    """Convert Infomap labels into a contiguous supernode mapping."""
+    labels = np.asarray(labels)
+    N = labels.shape[0]
+    valid = labels >= 0
+    if not np.any(valid):
+        return np.full(N, -1, dtype=np.int64), np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+
+    u, c = np.unique(labels[valid], return_counts=True)
+    keep_mask = c >= int(min_cluster_size)
+    kept_labels = u[keep_mask].astype(np.int64, copy=False)
+    kept_counts = c[keep_mask].astype(np.int64, copy=False)
+
+    if kept_labels.shape[0] == 0:
+        return np.full(N, -1, dtype=np.int64), np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+
+    order = np.argsort(kept_labels)
+    kept_labels = kept_labels[order]
+    kept_counts = kept_counts[order]
+
+    max_lab = int(labels[valid].max())
+    lab2super = np.full(max_lab + 1, -1, dtype=np.int64)
+    lab2super[kept_labels] = np.arange(kept_labels.shape[0], dtype=np.int64)
+
+    node2super = np.full(N, -1, dtype=np.int64)
+    node2super[valid] = lab2super[labels[valid].astype(np.int64)]
+
+    return node2super, kept_counts, kept_labels
+
+
+def _compute_supernode_means_chunked(coords_source, node2super, anchor_super_ids, out_npy_path=None, chunk_size=250000):
+    """Compute parent-space centroids for a selected set of supernodes in chunks."""
+    if isinstance(coords_source, (str, os.PathLike)):
+        coords = np.load(str(coords_source), mmap_mode='r')
+    else:
+        coords = np.asarray(coords_source)
+
+    node2super = np.asarray(node2super, dtype=np.int64)
+    anchor_super_ids = np.asarray(anchor_super_ids, dtype=np.int64)
+
+    if coords.ndim != 2:
+        raise ValueError(f"coords_source must resolve to a 2D array; got shape {coords.shape}")
+    if node2super.shape[0] != coords.shape[0]:
+        raise ValueError(
+            f"node2super length {node2super.shape[0]} != coords rows {coords.shape[0]}"
+        )
+
+    m_anchor = int(anchor_super_ids.shape[0])
+    d = int(coords.shape[1])
+    if m_anchor == 0:
+        means = np.zeros((0, d), dtype=np.float64)
+        if out_npy_path is not None:
+            np.save(out_npy_path, means)
+        return means
+
+    max_super = int(max(int(np.max(node2super[node2super >= 0])) if np.any(node2super >= 0) else -1, int(np.max(anchor_super_ids)))) + 1
+    super_to_anchor = np.full(max_super, -1, dtype=np.int64)
+    super_to_anchor[anchor_super_ids] = np.arange(m_anchor, dtype=np.int64)
+
+    sums = np.zeros((m_anchor, d), dtype=np.float64)
+    counts = np.zeros((m_anchor,), dtype=np.int64)
+    N = int(coords.shape[0])
+
+    for start in range(0, N, int(chunk_size)):
+        end = min(N, start + int(chunk_size))
+        super_chunk = node2super[start:end]
+        valid = super_chunk >= 0
+        if not np.any(valid):
+            continue
+
+        anchor_local = super_to_anchor[super_chunk[valid]]
+        keep = anchor_local >= 0
+        if not np.any(keep):
+            continue
+
+        anchor_local = anchor_local[keep]
+        X = np.asarray(coords[start:end, :], dtype=np.float64)[valid, :][keep, :]
+
+        counts += np.bincount(anchor_local, minlength=m_anchor).astype(np.int64, copy=False)
+        for dim in range(d):
+            sums[:, dim] += np.bincount(
+                anchor_local,
+                weights=X[:, dim],
+                minlength=m_anchor,
+            ).astype(np.float64, copy=False)
+
+    if np.any(counts <= 0):
+        missing = np.where(counts <= 0)[0]
+        raise ValueError(
+            "Some anchor supernodes had no contributing fine nodes when computing means: "
+            + str(missing[:10])
+        )
+
+    means = sums / counts[:, None]
+    if out_npy_path is not None:
+        np.save(out_npy_path, means)
+    return means
+
+
+def _file_stat_payload_with_mtime(path):
+    payload = _file_stat_payload(path)
+    if payload is None:
+        return None
+    try:
+        st = os.stat(path)
+        payload = dict(payload)
+        payload['mtime_ns'] = int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1.0e9)))
+    except Exception:
+        pass
+    return payload
+
+
+def _final_coarsening_paths(gdp):
+    root = _ensure_trailing_slash(os.path.join(_ensure_trailing_slash(str(gdp)), _FINAL_COARSEN_DIRNAME))
+    coarse_dir = _ensure_trailing_slash(os.path.join(root, _FINAL_COARSEN_COMPONENT_DIRNAME))
+    return {
+        'root': root,
+        'coarse_dir': coarse_dir,
+        'meta': os.path.join(root, _FINAL_COARSEN_META_FILENAME),
+        'align_meta': os.path.join(root, _FINAL_COARSEN_ALIGN_META_FILENAME),
+        'labels': os.path.join(root, 'infomap_labels.npy'),
+        'labels_meta': os.path.join(root, 'infomap_labels.meta.json'),
+        'node2super': os.path.join(root, 'node2super.npy'),
+        'super_size': os.path.join(root, 'super_size.npy'),
+        'kept_cluster_labels': os.path.join(root, 'kept_cluster_labels.npy'),
+        'keep_super': os.path.join(root, 'largest_component_supernodes.npy'),
+        'coarse_anchor_supernodes': os.path.join(root, 'coarse_anchor_supernodes.npy'),
+        'coarse_anchor_search_coords': os.path.join(root, 'coarse_anchor_search_coords.npy'),
+        'coarse_anchor_search_meta': os.path.join(root, 'coarse_anchor_search_coords.meta.json'),
+        'coarse_anchor_coords': os.path.join(root, 'coarse_anchor_coords.npy'),
+        'coarse_anchor_coords_final_gse': os.path.join(root, 'coarse_anchor_coords_final_gse.npy'),
+        'coarse_link': os.path.join(coarse_dir, 'link_assoc_reindexed.npz'),
+        'coarse_tm': os.path.join(coarse_dir, 'transformed_matrix.npz'),
+        'coarse_index_key': os.path.join(coarse_dir, 'index_key.npy'),
+        'coarse_gse': os.path.join(coarse_dir, 'GSEoutput.txt'),
+        'coarse_gse_meta': os.path.join(coarse_dir, 'GSEoutput_meta.json'),
+        'coarse_input_meta': os.path.join(coarse_dir, 'coarse_input_meta.json'),
+        'coarse_h5ad': os.path.join(coarse_dir, 'final.h5ad'),
+        'coarse_moments': os.path.join(root, _REGISTER_ZF_COARSE_MOMENTS_FILENAME),
+        'coarse_moments_meta': os.path.join(root, _REGISTER_ZF_COARSE_MOMENTS_META_FILENAME),
     }
-    with open(os.path.join(filtered_path, "filter_stats.json"), "w") as fh:
-        json.dump(stats, fh, indent=2, sort_keys=True)
+
+
+def _final_coarsen_align_request(gdp, params, output_name, final_cluster_result):
+    labels = np.asarray(final_cluster_result['labels_infomap'], dtype=np.int32).reshape(-1)
+    label_digest = _digest_arrays_hex_streaming(labels)
+    return {
+        'layout_version': 2,
+        'mode': 'final_infomap_coarsen_register_zf_alignment',
+        'output_name': str(output_name),
+        'supernode_policy': 'one_supernode_per_nonnegative_final_infomap_label',
+        'inference_dim': int(params['-inference_dim']),
+        'inference_eignum': int(params['-inference_eignum']),
+        'register_zf': _param_optional_str(params, '-register_zf'),
+        'slice_path': None if _param_optional_str(params, '-slice_path') is None else os.path.abspath(_param_optional_str(params, '-slice_path')),
+        'match_lam_dir': float(_param_first(params, '-register_zf_match_lam_dir', _REGISTER_ZF_MATCH_LAM_DIR)),
+        'match_refine_iter': int(_param_first(params, '-register_zf_match_refine_iter', _REGISTER_ZF_MATCH_REFINE_ITER)),
+        'ensemble_size': int(_param_first(params, '-register_zf_ensemble_size', _REGISTER_ZF_ENSEMBLE_SIZE)),
+        'final_gse_file': _file_stat_payload_with_mtime(os.path.join(_ensure_trailing_slash(str(gdp)), str(output_name))),
+        'final_transport_file': _file_stat_payload_with_mtime(final_cluster_result.get('tm_final_path')),
+        'final_cluster_labels_file': _file_stat_payload_with_mtime(final_cluster_result.get('cluster_labels_path')),
+        'final_cluster_labels_meta_file': _file_stat_payload_with_mtime(final_cluster_result.get('cluster_labels_meta_path')),
+        'raw_link_file': _file_stat_payload_with_mtime(final_cluster_result.get('link_path')),
+        'labels_infomap_digest': label_digest,
+        'n_fine_nodes': int(labels.shape[0]),
+        'no_fine_lift': True,
+    }
+
+def _final_coarsening_meta_matches(meta, request):
+    return isinstance(meta, dict) and meta.get('request') == request
+
+
+def _run_final_coarsen_align_pipeline(params, output_name, final_cluster_result, *, force=False):
+    """Build final Infomap coarsening outputs and run register_zf on them.
+
+    This is the only coarsen-and-align path after the patch.  It consumes the
+    final embedding and the final-embedding NNLS/simplex transport matrix,
+    forms a coarsened aggregate graph under final_coarsening/component0, builds
+    the coarsened aggregate h5ad, and runs register_zf there.  It never installs
+    a different transformed_matrix.npz for full_GSE and never lifts the
+    coarsened slice assignment back to fine nodes.
+    """
+    gdp = _ensure_trailing_slash(str(sysOps.globaldatapath))
+    _validate_coarsen_alignment_mode(params)
+
+    register_zf_flag = _param_optional_str(params, '-register_zf')
+    slice_path = _param_optional_str(params, '-slice_path')
+    if register_zf_flag is None:
+        raise ValueError('Final coarsen-and-align requires -register_zf.')
+    if slice_path is None:
+        raise ValueError('-register_zf requires -slice_path pointing to the raw slice h5ad.')
+
+    inference_dim = int(params['-inference_dim'])
+    if inference_dim not in (2, 3):
+        raise ValueError(
+            '-register_zf direct probing is only supported for inference_dim in {2, 3}; '
+            'got ' + str(inference_dim) + '.'
+        )
+
+    annotation_binary_threshold = int(params.get('-coarsen_annotation_binary_threshold', _COARSEN_ANNOTATION_BINARIZE_THRESHOLD))
+    paths = _final_coarsening_paths(gdp)
+    os.makedirs(paths['root'], exist_ok=True)
+    os.makedirs(paths['coarse_dir'], exist_ok=True)
+    os.makedirs(os.path.join(paths['coarse_dir'], 'tmp'), exist_ok=True)
+
+    request = _final_coarsen_align_request(gdp, params, output_name, final_cluster_result)
+    prev_meta = _safe_load_json(paths['meta']) if os.path.exists(paths['meta']) else None
+    inputs_match = bool((not force) and _final_coarsening_meta_matches(prev_meta, request))
+
+    Xpts_final = np.asarray(final_cluster_result['Xpts_final'], dtype=np.float64)
+    labels_infomap = np.asarray(final_cluster_result['labels_infomap'], dtype=np.int64).reshape(-1)
+    link_csr = final_cluster_result.get('link_csr')
+    if link_csr is None:
+        link_csr = load_npz(os.path.join(gdp, 'link_assoc_reindexed.npz')).tocsr()
+    else:
+        link_csr = link_csr.tocsr()
+    tm_final_path = str(final_cluster_result['tm_final_path'])
+    if not os.path.exists(tm_final_path):
+        raise FileNotFoundError('Final-embedding transformed matrix not found: ' + tm_final_path)
+
+    if labels_infomap.shape[0] != int(link_csr.shape[0]):
+        raise ValueError(
+            'Final Infomap labels length ' + str(labels_infomap.shape[0]) +
+            ' does not match link graph rows ' + str(link_csr.shape[0]) + '.'
+        )
+    if Xpts_final.shape[0] != int(link_csr.shape[0]):
+        raise ValueError(
+            'Final GSE coordinates rows ' + str(Xpts_final.shape[0]) +
+            ' does not match link graph rows ' + str(link_csr.shape[0]) + '.'
+        )
+
+    coarse_core_ready = all(os.path.exists(paths[k]) for k in (
+        'node2super', 'super_size', 'kept_cluster_labels', 'keep_super',
+        'coarse_link', 'coarse_tm', 'coarse_index_key', 'coarse_gse',
+        'coarse_anchor_supernodes', 'coarse_anchor_coords_final_gse',
+    ))
+
+    if (not inputs_match) or (not coarse_core_ready):
+        sysOps.throw_status('Building final_coarsening/component0 from final Infomap labels and final embedding transport matrix.')
+        _remove_register_zf_visualization_artifacts(paths['root'])
+        # If the same final_coarsening path is being reused for changed inputs,
+        # force the aggregate h5ad and register_zf outputs to be regenerated.
+        for stale_path in (paths['coarse_h5ad'],):
+            if os.path.exists(stale_path):
+                try:
+                    os.remove(stale_path)
+                except Exception:
+                    pass
+        match_dir = os.path.join(paths['coarse_dir'], f'match_result_{str(register_zf_flag)}')
+        if os.path.isdir(match_dir):
+            try:
+                shutil.rmtree(match_dir)
+            except Exception:
+                pass
+
+        node2super, super_size, kept_labels = _build_supernodes_from_labels(labels_infomap, min_cluster_size=1)
+        M = int(super_size.shape[0])
+        if M < 1:
+            raise RuntimeError('Final Infomap coarsening produced no supernodes; cannot run register_zf alignment.')
+
+        _atomic_save_npy(paths['labels'], labels_infomap.astype(np.int64, copy=False))
+        _atomic_write_json(
+            paths['labels_meta'],
+            {
+                'layout_version': 1,
+                'source': 'final_post_GSEoutput_infomap_labels',
+                'cluster_labels_path': os.path.basename(str(final_cluster_result.get('cluster_labels_path'))),
+                'final_transport_path': os.path.basename(tm_final_path),
+                'supernode_policy': 'one_supernode_per_nonnegative_final_infomap_label',
+            },
+        )
+        _atomic_save_npy(paths['node2super'], np.asarray(node2super, dtype=np.int64))
+        _atomic_save_npy(paths['super_size'], np.asarray(super_size, dtype=np.int64))
+        _atomic_save_npy(paths['kept_cluster_labels'], np.asarray(kept_labels, dtype=np.int64))
+
+        P_final = load_npz(tm_final_path).tocsr()
+        if P_final.shape != link_csr.shape:
+            raise ValueError(
+                'Final transformed matrix shape ' + str(P_final.shape) +
+                ' does not match link graph shape ' + str(link_csr.shape) + '.'
+            )
+
+        sysOps.throw_status('Coarsening raw link graph and final-embedding NNLS transport graph (C^T W C).')
+        with threadpool_limits(limits=1):
+            Lc = _coarsen_sparse_by_mapping_matmul(link_csr, node2super, M, remove_diagonal=True)
+            Pc = _coarsen_sparse_by_mapping_matmul(P_final, node2super, M, remove_diagonal=True)
+
+        sym_Lc = (Lc + Lc.T).tocsr()
+        n_comp, comp_labels = connected_components(sym_Lc, directed=False, return_labels=True)
+        comp_weights = np.bincount(
+            comp_labels.astype(np.int64),
+            weights=super_size.astype(np.float64),
+            minlength=int(n_comp),
+        )
+        largest_comp = int(np.argmax(comp_weights))
+        keep_super = np.where(comp_labels == largest_comp)[0].astype(np.int64)
+        if keep_super.size < 1:
+            raise RuntimeError('Final coarsening largest component is empty.')
+        _atomic_save_npy(paths['keep_super'], keep_super)
+
+        L_sub = Lc[keep_super, :][:, keep_super].tocsr()
+        P_sub = Pc[keep_super, :][:, keep_super].tocsr()
+        save_npz(paths['coarse_link'], L_sub)
+        save_npz(paths['coarse_tm'], P_sub)
+
+        index_key = np.zeros((keep_super.shape[0], 3), dtype=np.int64)
+        index_key[:, 0] = 0
+        index_key[:, 1] = keep_super
+        index_key[:, 2] = np.arange(keep_super.shape[0], dtype=np.int64)
+        _atomic_save_npy(paths['coarse_index_key'], index_key)
+
+        anchor_coords = _compute_supernode_means_chunked(
+            Xpts_final,
+            node2super,
+            keep_super,
+            out_npy_path=paths['coarse_anchor_search_coords'],
+        )
+        anchor_coords = np.asarray(anchor_coords, dtype=np.float64)
+        if anchor_coords.shape[1] < inference_dim:
+            padded = np.zeros((anchor_coords.shape[0], inference_dim), dtype=np.float64)
+            padded[:, :anchor_coords.shape[1]] = anchor_coords
+            anchor_coords = padded
+        elif anchor_coords.shape[1] > inference_dim:
+            anchor_coords = anchor_coords[:, :inference_dim]
+
+        _atomic_save_npy(paths['coarse_anchor_search_coords'], anchor_coords)
+        _atomic_save_npy(paths['coarse_anchor_supernodes'], keep_super)
+        _atomic_save_npy(paths['coarse_anchor_coords'], anchor_coords)
+        _atomic_save_npy(paths['coarse_anchor_coords_final_gse'], anchor_coords)
+        _atomic_write_json(
+            paths['coarse_anchor_search_meta'],
+            _coarse_anchor_search_meta(
+                _digest_arrays_hex_streaming(node2super, keep_super, super_size, labels_infomap),
+                keep_super.shape[0],
+                anchor_coords.shape[1],
+            ),
+        )
+        _write_gseoutput_from_coords(paths['coarse_gse'], anchor_coords)
+
+        coarse_input_meta_payload = {
+            'layout_version': 1,
+            'mode': 'final_infomap_coarsening_for_register_zf_alignment',
+            'request': request,
+            'n_rows': int(keep_super.shape[0]),
+            'inference_dim': int(inference_dim),
+            'source_final_transport_matrix': os.path.basename(tm_final_path),
+            'source_final_labels': os.path.basename(paths['labels']),
+            'no_fine_lift': True,
+        }
+        _atomic_write_json(paths['coarse_input_meta'], coarse_input_meta_payload)
+        _atomic_write_json(
+            paths['coarse_gse_meta'],
+            {
+                'layout_version': 1,
+                'mode': 'final_infomap_cluster_centroids',
+                'n_rows': int(keep_super.shape[0]),
+                'inference_dim': int(inference_dim),
+                'source': 'centroids_of_final_GSEoutput_coordinates_by_final_infomap_supernode',
+                'no_coarse_full_GSE_run': True,
+            },
+        )
+        _atomic_write_json(
+            paths['meta'],
+            {
+                'layout_version': 1,
+                'request': request,
+                'root': os.path.basename(paths['root'].rstrip(os.sep)),
+                'coarse_dir': os.path.relpath(paths['coarse_dir'], gdp),
+                'n_fine_nodes': int(link_csr.shape[0]),
+                'n_supernodes_all': int(M),
+                'n_supernodes_largest_component': int(keep_super.shape[0]),
+                'coarsened_graph': os.path.relpath(paths['coarse_link'], paths['root']),
+                'coarsened_final_transport': os.path.relpath(paths['coarse_tm'], paths['root']),
+                'no_fine_lift': True,
+            },
+        )
+    else:
+        sysOps.throw_status('Reusing final_coarsening/component0 checkpoint for register_zf alignment.')
+        keep_super = np.load(paths['keep_super'], mmap_mode='r')
+        anchor_coords = np.load(paths['coarse_anchor_coords_final_gse'], mmap_mode='r')
+
+    keep_super = np.asarray(keep_super, dtype=np.int64)
+    anchor_coords = np.asarray(anchor_coords, dtype=np.float64)
+    coarse_n = int(keep_super.shape[0])
+
+    register_zf_force_recompute = bool(force or (not inputs_match))
+    coarse_h5ad_rebuilt = _build_coarsened_h5ad_from_parent(
+        parent_group_path=gdp,
+        coarse_group_path=paths['coarse_dir'],
+        node2super=np.load(paths['node2super'], mmap_mode='r'),
+        keep_super=keep_super,
+        super_size=np.load(paths['super_size'], mmap_mode='r'),
+        gse_output_name='GSEoutput.txt',
+        annotation_binary_threshold=annotation_binary_threshold,
+        extra_source_paths=[
+            paths['node2super'],
+            paths['keep_super'],
+            paths['coarse_index_key'],
+            paths['coarse_tm'],
+        ],
+    )
+    register_zf_force_recompute = bool(register_zf_force_recompute or coarse_h5ad_rebuilt)
+
+    from register_zf import get_aligned_coords_ensemble
 
     sysOps.throw_status(
-        "Filtered export complete: kept " +
-        str(stats["n_nodes_retained"]) + "/" + str(stats["n_nodes_input"]) +
-        " nodes and " + str(stats["n_edges_retained"]) + "/" + str(stats["n_edges_input"]) + " edges."
+        'Running deferred register_zf.get_aligned_coords_ensemble with ZF_FLAG=' +
+        str(register_zf_flag) + ' on final coarsened aggregate h5ad ' + os.path.abspath(paths['coarse_h5ad'])
     )
-    return filtered_path
+    ensemble_size = int(_param_first(params, '-register_zf_ensemble_size', _REGISTER_ZF_ENSEMBLE_SIZE))
+    ensemble_n_jobs, ensemble_threads_per_worker, ensemble_mp_start_method = _resolve_register_zf_ensemble_runtime(ensemble_size)
+    register_zf_resolved_config = {
+        'ensemble_size': int(ensemble_size),
+        'ensemble_seed': int(_REGISTER_ZF_ENSEMBLE_SEED),
+        'ensemble_mode': str(_REGISTER_ZF_ENSEMBLE_MODE),
+        'ensemble_tie_max': int(_REGISTER_ZF_ENSEMBLE_TIE_MAX),
+        'ensemble_perturb_units': int(_REGISTER_ZF_ENSEMBLE_PERTURB_UNITS),
+        'ensemble_rel_tol': float(_REGISTER_ZF_ENSEMBLE_REL_TOL),
+        'ensemble_abs_tol': float(_REGISTER_ZF_ENSEMBLE_ABS_TOL),
+        'ensemble_n_jobs_requested': int(ensemble_n_jobs),
+        'ensemble_threads_per_worker': int(ensemble_threads_per_worker),
+        'ensemble_mp_start_method': ensemble_mp_start_method,
+        'num_pole_pairs': int(_REGISTER_ZF_NUM_POLE_PAIRS),
+        'genes_per_pole': int(_REGISTER_ZF_GENES_PER_POLE),
+        'pole_pairs_json': None,
+        'slice_capacity_mode': str(_REGISTER_ZF_SLICE_CAPACITY_MODE),
+    }
+    register_zf_payload = get_aligned_coords_ensemble(
+        ZF_FLAG=str(register_zf_flag),
+        agg_h5ad_path=os.path.abspath(paths['coarse_h5ad']),
+        slice_h5ad_path=os.path.abspath(slice_path),
+        output_dir=os.path.join(paths['coarse_dir'], f'match_result_{str(register_zf_flag)}'),
+        force_recompute=register_zf_force_recompute,
+        force_ensemble_recompute=register_zf_force_recompute,
+        ensemble_size=ensemble_size,
+        ensemble_seed=int(_REGISTER_ZF_ENSEMBLE_SEED),
+        ensemble_mode=str(_REGISTER_ZF_ENSEMBLE_MODE),
+        ensemble_tie_max=int(_REGISTER_ZF_ENSEMBLE_TIE_MAX),
+        ensemble_perturb_units=int(_REGISTER_ZF_ENSEMBLE_PERTURB_UNITS),
+        ensemble_rel_tol=float(_REGISTER_ZF_ENSEMBLE_REL_TOL),
+        ensemble_abs_tol=float(_REGISTER_ZF_ENSEMBLE_ABS_TOL),
+        ensemble_n_jobs=int(ensemble_n_jobs),
+        ensemble_threads_per_worker=int(ensemble_threads_per_worker),
+        ensemble_mp_start_method=ensemble_mp_start_method,
+        num_pole_pairs=int(_REGISTER_ZF_NUM_POLE_PAIRS),
+        genes_per_pole=int(_REGISTER_ZF_GENES_PER_POLE),
+        match_lam_dir=float(_param_first(params, '-register_zf_match_lam_dir', _REGISTER_ZF_MATCH_LAM_DIR)),
+        match_refine_iter=int(_param_first(params, '-register_zf_match_refine_iter', _REGISTER_ZF_MATCH_REFINE_ITER)),
+        tree_workers=int(getattr(sysOps, 'num_workers', NTHREADS)),
+        pole_pairs_json=None,
+        slice_capacity_mode=str(_REGISTER_ZF_SLICE_CAPACITY_MODE),
+        return_payload=True,
+    )
+
+    coarse_registered_xy_ensemble = np.asarray(register_zf_payload['coords'], dtype=np.float64)
+    if coarse_registered_xy_ensemble.ndim != 3 or coarse_registered_xy_ensemble.shape[1] != int(coarse_n):
+        raise ValueError(
+            'register_zf ensemble shape ' + str(coarse_registered_xy_ensemble.shape) +
+            ' is incompatible with final coarsened node count ' + str(coarse_n) + '.'
+        )
+    obs_dim = _expected_register_zf_obs_dim(inference_dim)
+    if int(coarse_registered_xy_ensemble.shape[2]) != int(obs_dim):
+        raise ValueError(
+            'register_zf ensemble returned ' + str(coarse_registered_xy_ensemble.shape[2]) +
+            ' coordinate dimension(s); final coarsen/register_zf with inference_dim=' +
+            str(inference_dim) + ' expects exactly ' + str(obs_dim) + '.'
+        )
+
+    coarse_registered_xy_prior_mean = np.mean(coarse_registered_xy_ensemble, axis=0)
+    anchor_prior_coords = np.asarray(anchor_coords, dtype=np.float64).copy()
+    anchor_prior_coords[:, :int(obs_dim)] = coarse_registered_xy_prior_mean
+    viz_meta = _save_register_zf_visualization_artifacts(
+        gdp=paths['root'],
+        coarse_registered_xy_ensemble=coarse_registered_xy_ensemble,
+        anchor_prior_coords=anchor_prior_coords,
+        anchor_gse_coords=np.asarray(anchor_coords, dtype=np.float64),
+        register_zf_payload=register_zf_payload,
+        register_zf_resolved_config=register_zf_resolved_config,
+        inference_dim=int(inference_dim),
+        obs_dim=int(obs_dim),
+    )
+    coarse_moments = _coarse_node_moments_from_register_ensemble(
+        coarse_registered_xy_ensemble,
+        np.asarray(anchor_coords, dtype=np.float64),
+        inference_dim=int(inference_dim),
+        cov_floor=float(_REGISTER_ZF_MOMENT_COV_FLOOR),
+    )
+    coarse_moments_path, coarse_moments_meta_path = _write_coarse_node_moments_file(
+        out_root=paths['root'],
+        moments=coarse_moments,
+        register_zf_resolved_config=register_zf_resolved_config,
+        register_zf_payload=register_zf_payload,
+    )
+    copied_aliases = _copy_register_zf_coarse_alignment_aliases(paths['root'], register_zf_payload)
+
+    alignment_meta = {
+        'layout_version': 1,
+        'mode': 'final_coarsened_register_zf_alignment',
+        'request': request,
+        'no_fine_lift': True,
+        'coarse_node_count': int(coarse_n),
+        'fine_node_count': int(link_csr.shape[0]),
+        'final_coarsening_root': os.path.abspath(paths['root']),
+        'coarse_h5ad_path': os.path.abspath(paths['coarse_h5ad']),
+        'register_zf_output_dir': register_zf_payload.get('output_dir'),
+        'register_zf_ensemble_npz_path': register_zf_payload.get('ensemble_npz_path'),
+        'coarse_moments_path': os.path.abspath(coarse_moments_path),
+        'coarse_moments_meta_path': os.path.abspath(coarse_moments_meta_path),
+        'copied_coarse_alignment_aliases': copied_aliases,
+        'visualization_artifacts': viz_meta,
+        'coarse_aggregated_to_slice_mapping_path': None if register_zf_payload.get('output_dir') is None else os.path.join(register_zf_payload.get('output_dir'), 'aggregated_to_slice_match_csr.npz'),
+        'coarse_slice_to_aggregated_mapping_path': None if register_zf_payload.get('output_dir') is None else os.path.join(register_zf_payload.get('output_dir'), 'slice_to_aggregated_match_csr.npz'),
+        'coarse_registered_xy_ensemble_shape': [int(x) for x in coarse_registered_xy_ensemble.shape],
+        'coarse_anchor_supernodes_path': os.path.basename(paths['coarse_anchor_supernodes']),
+        'coarse_anchor_coords_final_gse_path': os.path.basename(paths['coarse_anchor_coords_final_gse']),
+        'resolved_internal_config': register_zf_resolved_config,
+    }
+    _atomic_write_json(paths['align_meta'], alignment_meta)
+    sysOps.throw_status('Deferred final coarsen/register_zf alignment complete; coarse slice-node map left in final_coarsening form.')
+    return alignment_meta
 
 
 @njit(fastmath=True)
@@ -1392,7 +2992,6 @@ def transform_matrix_optimized(N, Z, nn_indices_csr, lambda_reg=1e-2,
         solver_tol (float): stopping tolerance for FISTA (iterate diff).
         max_iter (int):     maximum FISTA iterations.
         backtracking_steps (int): micro backtracking halvings (0–2 recommended).
-        use_gershgorin (bool): if True, use Gershgorin bound for step; else power iteration.
         use_fp32 (bool):    if True, use float32 for compute (bandwidth-speed tradeoff).
         fast_csr (bool):    if True, skip CSR duplicate/zero/sort housekeeping.
     """
@@ -1434,6 +3033,75 @@ def transform_matrix_optimized(N, Z, nn_indices_csr, lambda_reg=1e-2,
         N_new.sort_indices()
 
     return N_new
+
+
+# -----------------------------------------------------------------------------
+# Legacy coarsen/register_zf second-pass cleanup
+# -----------------------------------------------------------------------------
+
+def _purge_second_pass_solver_outputs(path, output_name=None, *, remove_transformed_matrix=True):
+    """Drop artifacts derived from the second-pass operator."""
+    path = _ensure_trailing_slash(str(path))
+    names = [
+        'evecs.npy',
+        'evals.npy',
+        'init_evecs.npy',
+        'rank_evecs.npy',
+        'new_evecs.npy',
+        'preorthbasis.npy',
+    ]
+    if remove_transformed_matrix:
+        names.insert(0, 'transformed_matrix.npz')
+    for name in names:
+        fpath = os.path.join(path, name)
+        if os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+    _purge_final_resume_outputs(path, output_name=output_name)
+
+
+def _drop_legacy_coarsen_align_second_pass_artifacts(gdp, output_name=None):
+    """Remove stale pre-patch coarsen-align operator artifacts.
+
+    The patched route must be identical to non-coarsen mode through
+    GSEoutput.txt.  Therefore a promoted aligned transformed_matrix.npz from an
+    older run is unsafe and forces second-pass recomputation from the ordinary
+    orig_evecs_gapnorm.npy basis.
+    """
+    gdp = _ensure_trailing_slash(str(gdp))
+    meta_path = os.path.join(gdp, 'coarsen_align_second_pass_operator.meta.json')
+    aligned_tm_path = os.path.join(gdp, 'transformed_matrix_coarsen_align.npz')
+    found = os.path.exists(meta_path) or os.path.exists(aligned_tm_path)
+    if not found:
+        return False
+
+    sysOps.throw_status(
+        'Removing legacy coarsen-align sampled-prior second-pass artifacts so full_GSE uses the ordinary non-coarsen transformed matrix.'
+    )
+    for name in (
+        'coarsen_align_second_pass_operator.meta.json',
+        'transformed_matrix_coarsen_align.npz',
+        'orig_evecs_coarsen_align.npy',
+        'orig_evecs_coarsen_align.meta.json',
+        'orig_evecs_gapnorm_coarsen_align.npy',
+        'orig_evecs_gapnorm_coarsen_align.meta.json',
+        'orig_evecs_gapnorm_coarsen_align_stacked.npy',
+        'orig_evecs_gapnorm_coarsen_align_stacked.meta.json',
+        'coarsen_align_fine_node_mu_cov.npz',
+        'coarsen_align_fine_node_mu_cov.meta.json',
+        'transformed_matrix_fine_to_coarse.npz',
+        'fine_to_coarse_nearest_anchor.npy',
+    ):
+        fpath = os.path.join(gdp, name)
+        if os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+    _purge_second_pass_solver_outputs(gdp, output_name=output_name, remove_transformed_matrix=True)
+    return True
 
 
 def spec_GSEobj(sub_GSEobj, output_Xpts_filename = None, init_eig_count = None, X_init=None, tot_main_outer_iters=1):
@@ -1604,16 +3272,7 @@ def spec_GSEobj(sub_GSEobj, output_Xpts_filename = None, init_eig_count = None, 
             final_iter_fn = sub_GSEobj.path + 'iter' + str(subGSEobj_eignum) + '_' + output_Xpts_filename
             out_fn = sub_GSEobj.path + output_Xpts_filename
             if (main_outer_iter == tot_main_outer_iters - 1) and os.path.exists(final_iter_fn):
-                try:
-                    out_mtime = os.path.getmtime(out_fn)
-                except Exception:
-                    out_mtime = -1
-                try:
-                    iter_mtime = os.path.getmtime(final_iter_fn)
-                except Exception:
-                    iter_mtime = -1
-
-                if (not os.path.exists(out_fn)) or (iter_mtime > out_mtime):
+                if (not os.path.exists(out_fn)) or os.path.getsize(out_fn) != os.path.getsize(final_iter_fn):
                     sysOps.throw_status('Resuming: promoting ' + final_iter_fn + ' -> ' + out_fn)
                     # keep iter snapshot; only (re)create the consolidated file
                     sysOps.sh('cp -p ' + final_iter_fn + ' ' + out_fn)
@@ -1775,12 +3434,12 @@ def spec_GSEobj(sub_GSEobj, output_Xpts_filename = None, init_eig_count = None, 
 
 
 def fill_params(params):
-    _reject_removed_coarsen_params(params)
-
-    # if unloaded from list, place params back in list
-    for el in params:
+    """Parse and persist only the route-level public GSE parameters."""
+    for el in list(params):
         if type(params[el]) != list and type(params[el]) != bool:
-            params[el] = list([params[el]])
+            params[el] = [params[el]]
+
+    _drop_nonpublic_register_zf_params(params)
 
     if '-inference_eignum' in params:
         params['-inference_eignum'] = int(params['-inference_eignum'][0])
@@ -1792,228 +3451,665 @@ def fill_params(params):
     else:
         params['-inference_dim'] = 2
 
-    if '-scales' in params:
-        params['-scales'] = int(params['-scales'][0])
-    else:
-        params['-scales'] = 1
-
     if '-final_eignum' in params:
         params['-final_eignum'] = int(params['-final_eignum'][0])
     else:
         params['-final_eignum'] = 100
 
-    if '-shape_match' in params:
-        params['-shape_match'] = str(params['-shape_match'][0])
+    # Required for v1-compatible non-coarsen output.  Default is the v1 default.
+    if '-scales' in params:
+        params['-scales'] = int(params['-scales'][0])
     else:
-        params['-shape_match'] = None
-
-    if '-filter' in params:
-        params['-filter'] = True
-    else:
-        params['-filter'] = None
-
-    if '-bifurcate_type' in params:
-        params['-bifurcate_type'] = int(params['-bifurcate_type'][0])
-    else:
-        params['-bifurcate_type'] = -1
-
-    if '-iterations' in params:
-        params['-iterations'] = int(params['-iterations'][0])
-    else:
-        params['-iterations'] = 1
-
-    if '-nonlinear_proj' in params:
-        params['-nonlinear_proj'] = int(params['-nonlinear_proj'][0])
-    else:
-        params['-nonlinear_proj'] = 0
-
-    if '-exit_code' in params:
-        params['-exit_code'] = str(params['-exit_code'][0])
-    else:
-        params['-exit_code'] = 'full'
+        params['-scales'] = 1
 
     if '-calc_final' in params:
-        v = str(params['-calc_final'][0]).strip() if len(params['-calc_final']) else ""
-        params['-calc_final'] = v if v else None
+        raw_calc_final = params['-calc_final'][0] if len(params['-calc_final']) else None
+        calc_final = '' if raw_calc_final is None else str(raw_calc_final).strip()
+        params['-calc_final'] = calc_final if calc_final else None
     else:
         params['-calc_final'] = None
 
-    if '-intermed_indexing_directory' in params:
-        params['-intermed_indexing_directory'] = str(params['-intermed_indexing_directory'][0])
+    params['-coarsen_infomap'] = True if '-coarsen_infomap' in params else None
+    if '-coarsen_K' in params:
+        try:
+            sysOps.throw_status('Ignoring legacy -coarsen_K; final coarsening uses final Infomap labels directly.')
+        except Exception:
+            pass
+        params.pop('-coarsen_K', None)
+
+    if '-register_zf' in params:
+        raw_register_zf = params['-register_zf'][0] if len(params['-register_zf']) else None
+        register_zf = '' if raw_register_zf is None else str(raw_register_zf).strip()
+        params['-register_zf'] = register_zf if register_zf else None
     else:
-        params['-intermed_indexing_directory'] = None
+        params['-register_zf'] = None
+
+    if '-slice_path' in params:
+        raw_slice_path = params['-slice_path'][0] if len(params['-slice_path']) else None
+        slice_path = '' if raw_slice_path is None else str(raw_slice_path).strip()
+        params['-slice_path'] = slice_path if slice_path else None
+    else:
+        params['-slice_path'] = None
+
+    if '-register_zf_match_lam_dir' in params:
+        params['-register_zf_match_lam_dir'] = float(params['-register_zf_match_lam_dir'][0])
+    else:
+        params['-register_zf_match_lam_dir'] = _REGISTER_ZF_MATCH_LAM_DIR
+
+    if '-register_zf_match_refine_iter' in params:
+        params['-register_zf_match_refine_iter'] = int(params['-register_zf_match_refine_iter'][0])
+    else:
+        params['-register_zf_match_refine_iter'] = _REGISTER_ZF_MATCH_REFINE_ITER
+
+    if '-register_zf_ensemble_size' in params:
+        params['-register_zf_ensemble_size'] = int(params['-register_zf_ensemble_size'][0])
+    else:
+        params['-register_zf_ensemble_size'] = _REGISTER_ZF_ENSEMBLE_SIZE
+
+    _drop_nonpublic_register_zf_params(params)
 
     if '-path' in params:
         params['-path'] = str(params['-path'][0])
         if not params['-path'].endswith('/'):
-            params['-path'] += "//"
+            params['-path'] += '//'
 
-    with open(params['-path'] + "params.txt", 'w') as paramfile:
-        for el in params:
-            sysOps.throw_status(el + " " + str(params[el]))
+    _validate_coarsen_alignment_mode(params)
+    if '-h5ad_include_sequences' in params:
+        params['-h5ad_include_sequences'] = True
+
+    ordered_keys = [
+        '-inference_eignum',
+        '-inference_dim',
+        '-scales',
+        '-final_eignum',
+        '-calc_final',
+    ]
+    if params.get('-h5ad_include_sequences') is True:
+        ordered_keys.append('-h5ad_include_sequences')
+    if params.get('-coarsen_infomap') is not None:
+        ordered_keys.extend([
+            '-coarsen_infomap',
+        ])
+    if params.get('-register_zf') is not None:
+        ordered_keys.extend([
+            '-register_zf',
+            '-slice_path',
+            '-register_zf_match_lam_dir',
+            '-register_zf_match_refine_iter',
+            '-register_zf_ensemble_size',
+        ])
+    ordered_keys.append('-path')
+
+    with open(params['-path'] + 'params.txt', 'w') as paramfile:
+        for el in ordered_keys:
+            if el not in params:
+                continue
+            sysOps.throw_status(el + ' ' + str(params[el]))
             if type(params[el]) == bool and params[el]:
-                paramfile.write(el + "\n")
+                paramfile.write(el + '\n')
             elif type(params[el]) != bool:
-                paramfile.write(el + ' ' + str(params[el]) + "\n")
+                paramfile.write(el + ' ' + str(params[el]) + '\n')
 
-def generalized_eigen_embedding(
-    subspace,
-    csr,
-    *,
-    r=None,
-    center=True,
-    l2_normalize=False,
-    stationary="uniform",  # "degree" or "uniform"
-    tau_rel=1e-8,
-    eps_rel=1e-12,
+
+from scipy.spatial.transform import Rotation
+from scipy.stats import rankdata
+
+
+def _haar_random_rotation(p, rng):
+    """Draw a Haar-uniform random orthogonal matrix in dimension p."""
+    if p == 3:
+        return Rotation.random(random_state=int(rng.integers(0, 2**31 - 1))).as_matrix()
+
+    Z = rng.standard_normal((p, p))
+    Q, R = np.linalg.qr(Z)
+    d = np.sign(np.diag(R))
+    d[d == 0] = 1.0
+    Q *= d
+    return Q
+
+_RANK_POOL = ThreadPoolExecutor(max_workers=NTHREADS)
+
+def _rank_score_columns_exact(A, scale, center, out_dtype=np.float64):
+    n, p = A.shape
+    S = np.empty((n, p), dtype=out_dtype)
+
+    def _do_col(j):
+        col = np.asarray(A[:, j], dtype=np.float64)
+        S[:, j] = np.asarray(scale * (rankdata(col, method='average') - center), dtype=out_dtype)
+
+    if p >= 4:
+        list(_RANK_POOL.map(_do_col, range(p)))
+    else:
+        for j in range(p):
+            _do_col(j)
+
+    return S
+
+
+def _rank_score_columns_binned(
+    A, scale, center, rng, *,
+    n_bins=2048, sample_size=65536, out_dtype=np.float32,
 ):
-    """
-    Generalized eigen-embedding with adaptive diffusion-time (t) selection via
-    cutoff spectral gap at rank r.
+    n, p = A.shape
+    if n == 0:
+        return np.empty((0, p), dtype=out_dtype)
 
-    Chooses t from a small doubling grid {1,2,4,8,16} to maximize:
-        gap(t) = mu_r(t) - mu_{r+1}(t),
-    where mu_i(t) are eigenvalues of M(t)=H^{-1/2}G(t)H^{-1/2} in descending order.
+    B = int(max(8, min(int(n_bins), n)))
+    m = int(max(1, min(int(sample_size), n)))
+    sample_idx = None if m >= n else rng.choice(n, size=m, replace=False)
+    quantiles = np.linspace(0.0, 1.0, num=B + 1, dtype=np.float64)
 
-    Robust to subspace orientation:
-      - accepts X as (N,m) or (m,N) and auto-transposes if needed.
-    """
+    S = np.empty((n, p), dtype=out_dtype)
 
-    # --- adjacency / size (authoritative N) ---
-    if not scipy.sparse.isspmatrix_csr(csr):
-        A = csr.tocsr()
+    def _do_col(j):
+        col = np.asarray(A[:, j], dtype=np.float64)
+        sample = col if sample_idx is None else col[sample_idx]
+        finite_sample = sample[np.isfinite(sample)]
+        if finite_sample.size == 0:
+            S[:, j] = 0.0
+            return
+        edges = np.quantile(finite_sample, quantiles)
+        bins = np.searchsorted(edges[1:-1], col, side='right')
+        counts = np.bincount(bins, minlength=B).astype(np.float64, copy=False)
+        starts = np.cumsum(counts) - counts
+        midranks = starts + 0.5 * (counts + 1.0)
+        S[:, j] = np.asarray(scale * (midranks[bins] - center), dtype=out_dtype)
+
+    if p >= 4:
+        list(_RANK_POOL.map(_do_col, range(p)))
     else:
-        A = csr
-    A = A.astype(np.float64, copy=False)
-    n = A.shape[0]
-    if A.shape[1] != n:
-        raise ValueError(f"csr must be square, got {A.shape}.")
+        for j in range(p):
+            _do_col(j)
 
-    # --- subspace (accept (N,m) or (m,N)) ---
-    X = np.asarray(subspace, dtype=np.float64)
+    return S
+
+
+def _rank_score_columns(
+    A,
+    scale,
+    center,
+    *,
+    rank_mode='exact',
+    rng=None,
+    n_bins=2048,
+    sample_size=65536,
+    out_dtype=np.float64,
+):
+    """Rank-transform columns of A into centered, unit-norm scores.
+
+    Backward compatible with the previous signature:
+        _rank_score_columns(A, scale, center)
+
+    Parameters
+    ----------
+    rank_mode : {'exact', 'binned', 'auto'}
+        - 'exact': full per-column ranking with tie handling.
+        - 'binned': sampled-quantile approximation for very large n.
+        - 'auto': currently resolves to 'exact' here; rank_rotation_embedding()
+          chooses between exact and binned explicitly before calling.
+    """
+    mode = str(rank_mode).lower()
+    if mode in ('exact', 'auto'):
+        return _rank_score_columns_exact(A, scale, center, out_dtype=out_dtype)
+    if mode in ('binned', 'approx', 'binned_approx'):
+        if rng is None:
+            rng = np.random.default_rng()
+        return _rank_score_columns_binned(
+            A,
+            scale,
+            center,
+            rng,
+            n_bins=n_bins,
+            sample_size=sample_size,
+            out_dtype=out_dtype,
+        )
+    raise ValueError(f"Unsupported rank_mode={rank_mode!r}")
+
+
+def _resolve_rank_mode(rank_mode, n, exact_rank_max_n):
+    mode = str(rank_mode).lower()
+    if mode == 'auto':
+        return 'exact' if int(n) <= int(exact_rank_max_n) else 'binned'
+    if mode in ('exact', 'binned', 'approx', 'binned_approx'):
+        return 'binned' if mode != 'exact' else 'exact'
+    raise ValueError("rank_mode must be one of {'auto', 'exact', 'binned'}")
+
+
+def _reorth_basis(U, basis_dtype=np.float32):
+    """Re-orthonormalize a thin basis while preserving column order as much as possible."""
+    if U is None or U.size == 0:
+        return U
+    U64 = orth_preserve_order(np.asarray(U, dtype=np.float64, order='F'))
+    return np.asarray(U64, dtype=basis_dtype, order='F')
+
+
+def _incremental_svd_update(U, s, B, rank_keep, *, basis_dtype=np.float32, residual_tol=1e-7):
+    """Incrementally update a truncated SVD with a streamed column block.
+
+    If A ≈ U diag(s) V^T is the current approximation, this updates the top
+    rank_keep left singular vectors/singular values of [A, B] without storing A.
+    """
+    B = np.ascontiguousarray(B, dtype=basis_dtype)
+    if B.ndim != 2:
+        raise ValueError("B must be 2D")
+
+    if U is None or s is None or len(s) == 0:
+        Q, R = np.linalg.qr(B, mode='reduced')
+        Ucore, Sh, _ = np.linalg.svd(np.asarray(R, dtype=np.float64), full_matrices=False)
+        keep = min(int(rank_keep), int(Sh.shape[0]))
+        if keep == 0:
+            return np.empty((B.shape[0], 0), dtype=basis_dtype, order='F'), np.empty((0,), dtype=np.float64)
+        U_new = Q @ np.asarray(Ucore[:, :keep], dtype=Q.dtype)
+        return np.asfortranarray(U_new[:, :keep]), np.asarray(Sh[:keep], dtype=np.float64)
+
+    U = np.asarray(U, dtype=basis_dtype, order='F')
+    s = np.asarray(s, dtype=np.float64)
+    r = int(U.shape[1])
+
+    P = U.T @ B
+    residual = B - U @ P
+
+    q = 0
+    Qr = None
+    Rr = None
+    if residual.shape[1] > 0:
+        Qr, Rr = np.linalg.qr(residual, mode='reduced')
+        if Rr.size > 0:
+            diag = np.abs(np.diag(Rr)).astype(np.float64, copy=False)
+            tol = residual_tol * float(np.max(diag)) if diag.size > 0 else 0.0
+            keep_q = diag > tol
+            q = int(np.sum(keep_q))
+            if q > 0:
+                Qr = np.ascontiguousarray(Qr[:, :q], dtype=basis_dtype)
+                Rr = np.asarray(Rr[:q, :], dtype=np.float64)
+
+    P64 = np.asarray(P, dtype=np.float64)
+    Sdiag = np.diag(s)
+
+    if q > 0:
+        upper = np.concatenate([Sdiag, P64], axis=1)
+        lower = np.concatenate([np.zeros((q, r), dtype=np.float64), Rr], axis=1)
+        Ksmall = np.concatenate([upper, lower], axis=0)
+        Ucore, Sh, _ = np.linalg.svd(Ksmall, full_matrices=False)
+        keep = min(int(rank_keep), int(Sh.shape[0]))
+        basis_cat = np.concatenate([U, Qr], axis=1)
+        coeffs = np.asarray(Ucore[:, :keep], dtype=basis_cat.dtype)
+        U_new = basis_cat @ coeffs
+    else:
+        Ksmall = np.concatenate([Sdiag, P64], axis=1)
+        Ucore, Sh, _ = np.linalg.svd(Ksmall, full_matrices=False)
+        keep = min(int(rank_keep), int(Sh.shape[0]))
+        coeffs = np.asarray(Ucore[:, :keep], dtype=U.dtype)
+        U_new = U @ coeffs
+
+    return np.asfortranarray(U_new[:, :keep]), np.asarray(Sh[:keep], dtype=np.float64)
+
+
+def _sampled_subspace_change(U, sample_rows, d, prev_sample_basis=None):
+    """Heuristic subspace-change estimate from a fixed row sample.
+
+    Returns
+    -------
+    change : float
+        1 - mean(cos^2(theta_i)) over principal angles between the previous and
+        current sampled d-dimensional subspaces. Smaller is more stable.
+    new_sample_basis : ndarray
+        Orthonormal sampled basis to cache for the next check.
+    """
+    if U is None or U.size == 0:
+        return np.inf, prev_sample_basis
+
+    k = int(min(d, U.shape[1]))
+    if k <= 0:
+        return np.inf, prev_sample_basis
+
+    if sample_rows is None:
+        sample = np.asarray(U[:, :k], dtype=np.float64, order='F')
+    else:
+        sample = np.asarray(U[sample_rows, :k], dtype=np.float64, order='F')
+
+    sample_q, _ = np.linalg.qr(sample, mode='reduced')
+
+    if prev_sample_basis is None or prev_sample_basis.shape[1] != sample_q.shape[1]:
+        return np.inf, sample_q
+
+    sigma = np.linalg.svd(prev_sample_basis.T @ sample_q, compute_uv=False)
+    sigma = np.clip(sigma[:k], 0.0, 1.0)
+    overlap = float(np.mean(sigma * sigma))
+    return 1.0 - overlap, sample_q
+
+
+def rank_rotation_embedding(
+    X,
+    K=None,
+    d=None,
+    seed=None,
+    *,
+    oversample=8,
+    rank_mode='auto',
+    exact_rank_max_n=500_000,
+    approx_rank_bins=2048,
+    approx_rank_sample_size=65536,
+    block_cols=None,
+    basis_dtype=np.float32,
+    adaptive=None,
+    check_every=4,
+    subspace_tol=1e-2,
+    patience=2,
+    min_rotations=None,
+    max_rotations=None,
+    reorthogonalize_every=16,
+    require_convergence=True,
+    max_auto_rotations=None,
+):
+    """Memory-lean rank-rotation embedding via streamed block incremental SVD.
+
+    This replaces the dense-Z / dense-Gram / dense-kernel implementation with a
+    one-pass low-rank update over streamed rank-score blocks. It is designed for
+    very large n where materializing Z = [scores_1 ... scores_K] would cause OOM.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n, p)
+        Input embedding. Columns are centered implicitly during projection, so a
+        centered copy of X is never materialized.
+    K : int or None
+        If adaptive is None, an explicit K means "run exactly K rotations" and
+        adaptive=False. If K is None, the historical budget max(1, int(500 / p))
+        is used as the default *maximum* number of rotations and adaptive=True.
+    d : int or None
+        Number of components to return. Defaults to p.
+    seed : int or None
+        Random seed.
+    oversample : int
+        Extra retained singular directions inside the streaming SVD to stabilize
+        the leading d-dimensional subspace.
+    rank_mode : {'auto', 'exact', 'binned'}
+        Exact ranks are more faithful but require a full sort per streamed
+        column. Binned ranks approximate the empirical CDF using sampled quantile
+        bins and are much faster for very large n.
+    exact_rank_max_n : int
+        Auto-switch threshold for rank_mode='auto'.
+    approx_rank_bins, approx_rank_sample_size : int
+        Controls for the binned rank approximation.
+    block_cols : int or None
+        Number of rotated columns to process at once. Lower values reduce peak
+        memory. Defaults to p for small exact problems and min(p, 8) otherwise.
+    basis_dtype : numpy dtype
+        Storage dtype for the streamed basis and score blocks. float32 is the
+        intended large-scale mode.
+    adaptive : bool or None
+        Whether to stop early when the top-d subspace stabilizes. When None,
+        adaptive defaults to (K is None).
+    check_every, subspace_tol, patience, min_rotations : control adaptive stop.
+    max_rotations : int or None
+        Hard cap on the number of rotations. Defaults to K when K is given, else
+        to max(1, int(500 / p)).
+    reorthogonalize_every : int
+        Periodically re-orthonormalize the streamed basis.
+    require_convergence : bool
+        If True and adaptive stopping is enabled, raise an error instead of
+        silently returning at max_rotations when the sampled-subspace
+        convergence criterion has not been satisfied.
+    max_auto_rotations : int or None
+        Optional safety ceiling used only when adaptive=True and the caller did
+        not explicitly supply K or max_rotations. None means "keep extending
+        the budget until convergence".
+
+    Returns
+    -------
+    embedding : ndarray of shape (n, d)
+        Rank-rotation embedding scaled by the retained singular values. The
+        function returns this single matrix, not a ``(U, s)`` tuple.
+    """
+    X = np.asarray(X)
     if X.ndim != 2:
-        raise ValueError("subspace must be 2D.")
-    if X.shape[0] != n:
-        if X.shape[1] == n:
-            X = X.T  # (m,N) -> (N,m)
-        else:
-            raise ValueError(
-                f"subspace shape {X.shape} incompatible with csr shape {A.shape}."
-            )
-    n, m = X.shape
-    if m == 0:
-        return X.copy()
+        raise ValueError(f"X must be 2D, got shape {X.shape}")
 
-    # r := min(m-1, r)
-    if r is None:
-        r = m
-    r = int(min(m - 1, int(r)))
-    if r <= 0:
-        return np.zeros((n, 0), dtype=np.float64)
+    n, p = X.shape
+    if n < 2:
+        raise ValueError(f"X must have at least 2 rows, got {n}")
+    if p < 2:
+        raise ValueError(f"X must have at least 2 columns, got {p}")
 
-    # --- preprocess X ---
-    if center:
-        X = X - X.mean(axis=0, keepdims=True)
-    if l2_normalize:
-        norms = np.linalg.norm(X, axis=0)
-        good = norms > 0
-        X[:, good] /= norms[good]
+    if d is None:
+        d = p
+    d = int(d)
+    if not 1 <= d <= p:
+        raise ValueError(f"d must satisfy 1 <= d <= p={p}, got d={d}")
 
-    # --- degrees / isolate mask ---
-    d = np.asarray(A.sum(axis=1)).ravel()
-    u = (d > 0).astype(np.float64)
+    if K is not None:
+        K = int(K)
+        if K < 1:
+            raise ValueError(f"K must be >= 1, got {K}")
 
-    # --- build P ---
-    if stationary == "uniform":
-        # Metropolis / max-degree: P_ij = A_ij / max(d_i,d_j), i!=j; then fill diag.
-        coo = A.tocoo(copy=False)
-        mask = coo.row != coo.col
-        rows = coo.row[mask]
-        cols = coo.col[mask]
-        denom = np.maximum(d[rows], d[cols])
+    if adaptive is None:
+        adaptive = (K is None)
+    adaptive = bool(adaptive)
+    user_supplied_max_rotations = (max_rotations is not None)
+    explicit_rotation_budget = (K is not None) or user_supplied_max_rotations
+    if explicit_rotation_budget and max_auto_rotations is not None:
+        raise ValueError(
+            "max_auto_rotations cannot be combined with an explicit rotation "
+            "budget (K or max_rotations)."
+        )
 
-        data = coo.data[mask].astype(np.float64, copy=False)
-        data = np.divide(data, denom, out=np.zeros_like(data), where=denom > 0)
+ 
+    if max_rotations is None:
+        max_rotations = K if K is not None else max(1, int(500 / p))
+    max_rotations = int(max_rotations)
+    if max_rotations < 1:
+        raise ValueError(f"max_rotations must be >= 1, got {max_rotations}")
+    initial_max_rotations = int(max_rotations)
+ 
+    if adaptive and max_auto_rotations is None and not explicit_rotation_budget:
+        max_auto_rotations = max(50, 4 * initial_max_rotations)
+ 
+    if not adaptive and K is not None:
+        max_rotations = K
+ 
+    check_every = max(1, int(check_every))
+    patience = max(1, int(patience))
 
-        P_off = scipy.sparse.csr_matrix((data, (rows, cols)), shape=A.shape)
+    if adaptive:
+        if min_rotations is None:
+            min_rotations = max(2, check_every)
+        min_rotations = int(max(1, min_rotations))
 
-        row_sum = np.asarray(P_off.sum(axis=1)).ravel()
-        diag = np.zeros_like(d)
-        nz = d > 0
-        diag[nz] = np.clip(1.0 - row_sum[nz], 0.0, 1.0)
+        first_check = int(((min_rotations + check_every - 1) // check_every) * check_every)
+        min_required_rotations = int(first_check + patience * check_every)
 
-        P = (P_off + scipy.sparse.diags(diag, 0, format="csr")).tocsr()
+        if max_rotations < min_required_rotations:
+            if explicit_rotation_budget:
+                raise ValueError(
+                    "adaptive=True requires enough rotation budget to evaluate "
+                    "the sampled-subspace stop criterion: "
+                    f"need max_rotations >= {min_required_rotations} for "
+                    f"min_rotations={min_rotations}, check_every={check_every}, "
+                    f"patience={patience}; got {max_rotations}."
+                )
+            try:
+                sysOps.throw_status(
+                    "rank_rotation_embedding: increasing max_rotations from "
+                    f"{max_rotations} to {min_required_rotations} so the adaptive "
+                    "stop criterion can actually trigger."
+                )
+            except Exception:
+                pass
+            max_rotations = min_required_rotations
 
-    elif stationary == "degree":
-        inv_d = np.zeros_like(d)
-        nz = d > 0
-        inv_d[nz] = 1.0 / d[nz]
-        P = A.multiply(inv_d[:, None]).tocsr()
+        if max_auto_rotations is not None:
+            max_auto_rotations = int(max_auto_rotations)
+            if max_auto_rotations < min_required_rotations:
+                raise ValueError(
+                    "max_auto_rotations must be >= the minimum adaptive budget "
+                    f"{min_required_rotations}; got {max_auto_rotations}."
+                )
+            max_rotations = min(max_rotations, max_auto_rotations)
+        min_rotations = int(max(1, min(min_rotations, max_rotations)))
     else:
-        raise ValueError('stationary must be "uniform" or "degree".')
+        if min_rotations is None:
+            min_rotations = max_rotations
+        min_rotations = int(max(1, min(min_rotations, max_rotations)))
+ 
 
-    ones = np.ones(n, dtype=np.float64)
-    colsum = np.asarray(P.T @ ones).ravel()
+    chosen_rank_mode = _resolve_rank_mode(rank_mode, n, exact_rank_max_n)
+    basis_dtype = np.dtype(basis_dtype)
 
-    # --- build H (independent of t) ---
-    PX = P @ X                      # (N,m)
-    Q = X.T @ PX                    # (m,m) = X^T P X
+    if block_cols is None:
+        block_cols = min(p, 8)
+    block_cols = int(max(1, min(block_cols, p)))
 
-    diag_term = (X.T @ (u[:, None] * X)) + (X.T @ (colsum[:, None] * X))
-    H = diag_term - (Q + Q.T)
-    H = 0.5 * (H + H.T)
+    target_rank = int(min(p, d + max(0, int(oversample))))
 
-    # stabilize and form H^{-1/2}
-    mean_diag = float(np.trace(H) / m)
-    if not np.isfinite(mean_diag) or mean_diag <= 0:
-        mean_diag = 1.0
-    tau = float(tau_rel) * mean_diag
-    H_reg = H + tau * np.eye(m, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    col_means = np.asarray(X.mean(axis=0), dtype=np.float64)
+    scale = np.sqrt(12.0 / (n * (n ** 2 - 1)))
+    center = (n + 1.0) / 2.0
 
-    evals_H, U_H = np.linalg.eigh(H_reg)
-    max_eval = float(np.max(evals_H))
-    if not np.isfinite(max_eval) or max_eval <= 0:
-        max_eval = 1.0
-    eps = float(eps_rel) * max(1.0, max_eval)
-    evals_H = np.clip(evals_H, eps, None)
+    try:
+        sysOps.throw_status(
+            "rank_rotation_embedding: "
+            f"rank_mode={chosen_rank_mode}, adaptive={adaptive}, "
+            f"initial_max_rotations={initial_max_rotations}, "
+            f"max_rotations={max_rotations}, min_rotations={min_rotations}, "
+            f"check_every={check_every}, patience={patience}, "
+            f"block_cols={block_cols}, basis_dtype={basis_dtype.name}, "
+            f"target_rank={target_rank}."
+        )
+    except Exception:
+        pass
 
-    H_inv_sqrt = (U_H * (1.0 / np.sqrt(evals_H))) @ U_H.T
+    U = None
+    s = np.empty((0,), dtype=np.float64)
+    rotations_done = 0
 
-    # --- score helper: spectral gap at cutoff r ---
-    def gap_and_M_from_G(G):
-        M = H_inv_sqrt @ G @ H_inv_sqrt
-        M = 0.5 * (M + M.T)
-        ev = np.linalg.eigvalsh(M)     # ascending
-        mu = ev[::-1]                 # descending
-        return float(mu[r - 1] - mu[r]), M
+    if adaptive:
+        sample_size = int(min(n, max(4096, 2048 * max(1, d))))
+        sample_rows = None if sample_size >= n else np.sort(rng.choice(n, size=sample_size, replace=False))
+        prev_sample_basis = None
+        stable_checks = 0
+    else:
+        sample_rows = None
+        prev_sample_basis = None
+        stable_checks = 0
 
-    # t=1 uses Q directly: G1 = Sym(X^T P X)
-    best_gap, best_M = gap_and_M_from_G(0.5 * (Q + Q.T))
+    converged = False
+    while True:
+        while rotations_done < max_rotations:
+            R = _haar_random_rotation(p, rng)
+            for j0 in range(0, p, block_cols):
+                j1 = min(p, j0 + block_cols)
+                R_block = np.asarray(R[:, j0:j1], dtype=np.float64, order='F')
+                proj = np.asarray(X @ R_block, dtype=np.float64)
+                proj -= col_means @ R_block
+                scores = _rank_score_columns(
+                    proj,
+                    scale,
+                    center,
+                    rank_mode=chosen_rank_mode,
+                    rng=rng,
+                    n_bins=approx_rank_bins,
+                    sample_size=approx_rank_sample_size,
+                    out_dtype=basis_dtype,
+                )
+                U, s = _incremental_svd_update(
+                    U,
+                    s,
+                    scores,
+                    rank_keep=target_rank,
+                    basis_dtype=basis_dtype,
+                )
 
-    # --- tune t on a small doubling grid (cost ~ max(t) sparse multiplies) ---
-    PtX = PX
-    t_cur = 1
-    best_t = 1
-    for t_target in (2, 4, 8, 16):
-        while t_cur < t_target:
-            PtX = P @ PtX
-            t_cur += 1
+            rotations_done += 1
 
-        XtPtX = X.T @ PtX
-        gap, M = gap_and_M_from_G(0.5 * (XtPtX + XtPtX.T))
-        if gap > best_gap:
-            best_gap, best_M = gap, M
-            best_t = int(t_target)
+            if reorthogonalize_every and (rotations_done % int(reorthogonalize_every) == 0):
+                U = _reorth_basis(U, basis_dtype=basis_dtype)
 
-    # --- final embedding from best_M ---
-    evals_M, V = np.linalg.eigh(best_M)
-    idx = np.argsort(evals_M)[::-1]
-    V_r = V[:, idx[:r]]
+            if adaptive and rotations_done >= min_rotations and (
+                (rotations_done % check_every == 0) or (rotations_done == max_rotations)
+            ):
+                change, prev_sample_basis = _sampled_subspace_change(
+                    U,
+                    sample_rows,
+                    d,
+                    prev_sample_basis=prev_sample_basis,
+                )
+                if np.isfinite(change) and change <= float(subspace_tol):
+                    stable_checks += 1
+                else:
+                    stable_checks = 0
 
-    Y = X @ (H_inv_sqrt @ V_r)
+                try:
+                    sysOps.throw_status(
+                        "rank_rotation_embedding: "
+                        f"rotation={rotations_done}/{max_rotations}, sampled_subspace_change={change:.3e}, "
+                        f"stable_checks={stable_checks}/{patience}."
+                    )
+                except Exception:
+                    pass
 
-    sysOps.throw_status("Optimal t <- " + str(best_t))
-    return Y
+                if stable_checks >= patience:
+                    converged = True
+                    try:
+                        sysOps.throw_status(
+                            "rank_rotation_embedding: "
+                            f"early stop after {rotations_done} rotations "
+                            f"(sampled_subspace_change={change:.3e})."
+                        )
+                    except Exception:
+                        pass
+                    break
+
+        if converged or (not adaptive):
+            break
+
+        if not require_convergence:
+            break
+
+        if explicit_rotation_budget:
+            break
+
+        next_max_rotations = max(
+            max_rotations + check_every,
+            int(np.ceil(1.5 * max_rotations)),
+        )
+
+        if max_auto_rotations is not None:
+            if max_rotations >= max_auto_rotations:
+                break
+            next_max_rotations = min(next_max_rotations, max_auto_rotations)
+
+        if next_max_rotations <= max_rotations:
+            break
+
+        try:
+            sysOps.throw_status(
+                "rank_rotation_embedding: "
+                f"extending rotation budget from {max_rotations} to {next_max_rotations} "
+                "because the sampled-subspace stop criterion is not yet satisfied."
+            )
+        except Exception:
+            pass
+        max_rotations = int(next_max_rotations)
+ 
+
+    if adaptive and require_convergence and not converged:
+        raise RuntimeError(
+            "rank_rotation_embedding stopped before satisfying the "
+            "sampled-subspace stop criterion; "
+            f"rotations_done={rotations_done}, max_rotations={max_rotations}, "
+            f"min_rotations={min_rotations}, check_every={check_every}, "
+            f"patience={patience}, subspace_tol={subspace_tol}."
+        )
+ 
+    if U is None or s.size == 0:
+        raise RuntimeError("rank_rotation_embedding failed to accumulate any rank-score blocks")
+
+    U = np.asarray(U[:, :d], dtype=basis_dtype, order='F')
+    U = _reorth_basis(U, basis_dtype=basis_dtype)
+    s = np.asarray(s[:d], dtype=np.float64)
+    return U[:, :X.shape[1]] * s[np.newaxis, :X.shape[1]]
 
 
 def parallel_nbrs(nbrs, query_subset, start_idx, return_distances=True):
@@ -2082,9 +4178,9 @@ def parallel_annoy(index, query_subset, k, batch_size=1000, num_threads=None, se
 
     return nn_distances, nn_indices
 
+
 class dot2:
-    def __init__(self, csr_op1, csr_op2, rownorm=True):
-        # Convert operators to CSR if needed
+    def __init__(self, csr_op1, csr_op2):
         self.csr_op1 = csr_op1
         self.csr_op2 = csr_op2
         self.csr_op2T = csr_op2.T
@@ -2093,12 +4189,6 @@ class dot2:
 
     def dot(self, x):
         return self.csr_op2.dot(self.csr_op1.dot(self.csr_op2T.dot(x)))
-
-    def matvec(self, x):
-        return self.dot(x)
-
-    def matmat(self, X):
-        return self.dot(X)
         
 
 def parallel_knn(
@@ -2286,21 +4376,25 @@ def parallel_knn(
 
 
 def full_GSE(output_name, params):
-    # Primary function call for image inference and segmentation.
-    # Inputs:
-    #     imagemodule_input_filename: link data input file
-    #     other arguments: boolean settings for which subroutine to run
+    # Primary second-pass GSE solve and final coordinate export.
+    # Required route parameters include -path, -inference_dim,
+    # -inference_eignum, and -final_eignum; -calc_final controls final AnnData
+    # augmentation after coordinates and final cluster labels are available.
 
-    # The objective setup below matches the previous non-coarsened full solve.
+    # The objective setup below is shared by ordinary non-coarsen and
+    # coarsen-and-align runs.  Coarsen-and-align no longer installs a
+    # different transformed_matrix.npz before this function runs.
 
     if type(params['-inference_eignum']) == list:
         fill_params(params)
-    _reject_removed_coarsen_params(params)
+    _validate_coarsen_alignment_mode(params)
+    params.setdefault('-scales', 1)
     inference_eignum = int(params['-inference_eignum'])
     inference_dim = int(params['-inference_dim'])
     GSE_final_eigenbasis_size = int(params['-final_eignum'])
     sysOps.num_workers = NTHREADS
     sysOps.globaldatapath = str(params['-path'])
+    _remove_removed_align_kernel_artifacts(sysOps.globaldatapath, output_name=output_name)
     # Default: auto. If '-h5ad_include_sequences' is present, always include.
     # Otherwise, include sequences only when label_pt appears STAR-less and contains sequences.
     sysOps.h5ad_include_nonunique_genes = ('-h5ad_include_nonunique_genes' in params)
@@ -2312,6 +4406,11 @@ def full_GSE(output_name, params):
         pass
 
     this_GSEobj = GSEobj(inference_dim, inference_eignum)
+
+    _drop_legacy_coarsen_align_second_pass_artifacts(
+        sysOps.globaldatapath,
+        output_name=output_name,
+    )
 
     kneighbors = max(2 * inference_eignum, 10 * inference_dim)
     if not sysOps.check_file_exists("transformed_matrix.npz"):
@@ -2331,12 +4430,12 @@ def full_GSE(output_name, params):
         output0 += output0.T
         output0 *= 0.5
         save_npz(sysOps.globaldatapath + 'transformed_matrix.npz', output0)
-        del nn_indices_csr
+        del nn_indices, indices, indptr, data, nn_indices_csr, output0, scaled_evecs
 
     if not sysOps.check_file_exists('evecs.npy'):
         this_GSEobj.inference_eignum = int(GSE_final_eigenbasis_size)
         sysOps.throw_status("Generating final eigenbasis ...")
-        this_GSEobj.eigen_decomp(orth=True, pmax=1)
+        this_GSEobj.eigen_decomp(pmax=1,rank_transform=True)
     else:
         this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + "evecs.npy").T
 
@@ -2370,7 +4469,6 @@ def full_GSE(output_name, params):
 
     del this_GSEobj
     sysOps.throw_status("Initial output complete.")
-
 
 def reindex_input_files(path):
     
@@ -2496,7 +4594,7 @@ def partition_graph_csc_matrix(csc_mat, num_partitions):
     - num_partitions (int): The desired number of partitions.
 
     Returns:
-    - Tuple[List[int], List[int]]: A tuple containing the partition vector and the edge cut.
+    - List[int]: The partition vector returned by pymetis.part_graph().
     """
     # Ensure the matrix is symmetric (undirected graph) and has no self-loops
 
@@ -2510,7 +4608,9 @@ def partition_graph_csc_matrix(csc_mat, num_partitions):
     return partition
 
 def generate_fast_preorthbasis(csr_op1, k, metis_iterations = 1, spat_dims=3):
-
+    if sysOps.check_file_exists("preorthbasis.npy"):
+        sysOps.throw_status(sysOps.globaldatapath + "preorthbasis.npy found pre-computed.")
+        return
     csc = csr_op1.tocsc()
     Npts = csr_op1.shape[0]
     all_basis = list()
@@ -2608,25 +4708,7 @@ def generate_fast_preorthbasis(csr_op1, k, metis_iterations = 1, spat_dims=3):
     np.save(sysOps.globaldatapath + "preorthbasis.npy", np.concatenate(all_basis,axis=1))
     
 
-def parallel_krylov(krylov_num,csr_op1,diag,csr_op2,init_vector,rev_operator=False):
-    subspace = np.zeros([init_vector.shape[0],krylov_num],dtype=np.float64)
-    subspace[:,0] = init_vector-np.mean(init_vector)
-    for i in range(1,krylov_num):
-        if csr_op2 is None:
-            if rev_operator:
-                subspace[:,i] = diag.dot(csr_op1.dot(subspace[:,i-1]))
-            else:
-                subspace[:,i] = diag.dot(csr_op1.dot(subspace[:,i-1]))
-
-        else:
-            if rev_operator:
-                subspace[:,i] = diag.dot(csr_op2.dot(subspace[:,i-1]))
-            else:
-                subspace[:,i] = diag.dot(csr_op2.dot(csr_op1.dot(csr_op2.T.dot(subspace[:,i-1]))))
-    return subspace
-
-
-def parallel_krylov_fill(out_block, csr_op1, diag, csr_op2, init_vector, rev_operator=False):
+def parallel_krylov_fill(out_block, csr_op1, diag, csr_op2, init_vector):
     # out_block shape: (N, krylov_num)
     out_block[:, 0] = init_vector
     out_block[:, 0] -= np.mean(out_block[:, 0])
@@ -2636,28 +4718,23 @@ def parallel_krylov_fill(out_block, csr_op1, diag, csr_op2, init_vector, rev_ope
         if csr_op2 is None:
             out_block[:, i] = diag.dot(csr_op1.dot(prev))
         else:
-            if rev_operator:
-                out_block[:, i] = diag.dot(csr_op2.dot(prev))
-            else:
-                out_block[:, i] = diag.dot(
-                    csr_op2.dot(csr_op1.dot(csr_op2.T.dot(prev)))
-                )
+            out_block[:, i] = diag.dot(
+                csr_op2.dot(csr_op1.dot(csr_op2.T.dot(prev)))
+            )
 
 
-def get_eigs(csr_op1, k, csr_op2=None, krylov_iterations=5, rev_operator=False):
+def get_eigs(csr_op1, k, csr_op2=None, krylov_iterations=5):
     krylov_approx = sysOps.globaldatapath + "preorthbasis.npy"
     if csr_op2 is None:
         diag = scipy.sparse.diags(np.power(np.array(csr_op1.sum(axis=1)).flatten() + 1E-10, -1))
     else:
-        if rev_operator:
-            diag = scipy.sparse.diags(np.power(np.array(csr_op2.dot(np.ones(csr_op1.shape[0]))).flatten() + 1E-10, -1))
-        else:
-            deg = csr_op2.dot(
-                csr_op1.dot(
-                    csr_op2.T.dot(np.ones(csr_op1.shape[0], dtype=np.float64))
-                )
+        deg = csr_op2.dot(
+            csr_op1.dot(
+                csr_op2.T.dot(np.ones(csr_op1.shape[0], dtype=np.float64))
             )
-            diag = scipy.sparse.diags(np.power(np.array(deg).flatten() + 1E-10, -1))
+        )
+        diag = scipy.sparse.diags(np.power(np.array(deg).flatten() + 1E-10, -1))
+        del deg
 
     nseed = max(3, int(np.ceil(k / 10)))
 
@@ -2696,7 +4773,6 @@ def get_eigs(csr_op1, k, csr_op2=None, krylov_iterations=5, rev_operator=False):
                 diag,
                 csr_op2,
                 seq_evecs[:, i],
-                rev_operator,
             )
 
         Parallel(
@@ -2715,10 +4791,7 @@ def get_eigs(csr_op1, k, csr_op2=None, krylov_iterations=5, rev_operator=False):
         if csr_op2 is None:
             innerprod = krylov_space.T.dot(diag.dot(csr_op1.dot(krylov_space)))
         else:
-            if rev_operator:
-                innerprod = krylov_space.T.dot(diag.dot(csr_op2.dot(krylov_space)))
-            else:
-                innerprod = krylov_space.T.dot(diag.dot(csr_op2.dot(csr_op1.dot(csr_op2.T.dot(krylov_space)))))
+            innerprod = krylov_space.T.dot(diag.dot(csr_op2.dot(csr_op1.dot(csr_op2.T.dot(krylov_space)))))
 
         evals,evecs = LA.eig(innerprod)
 
@@ -2726,31 +4799,39 @@ def get_eigs(csr_op1, k, csr_op2=None, krylov_iterations=5, rev_operator=False):
         evecs = np.real(evecs[:,eval_order])
         evals = np.real(evals[eval_order])
         seq_evecs = krylov_space.dot(evecs)
+        del krylov_space, innerprod, evecs, evals
 
         seq_evecs -= np.mean(seq_evecs,axis=0)
         seq_evecs = seq_evecs / LA.norm(seq_evecs, axis=0, keepdims=True)
 
         if csr_op2 is None:
-            order = np.argsort(-np.diagonal(seq_evecs.T.dot(diag.dot(csr_op1.dot(seq_evecs)))))
+            Mv = diag.dot(csr_op1).dot(seq_evecs)
         else:
-            if rev_operator:
-                order = np.argsort(-np.diagonal(seq_evecs.T.dot(diag.dot(csr_op2.dot(seq_evecs)))))
-            else:
-                order = np.argsort(-np.diagonal(seq_evecs.T.dot(diag.dot(csr_op2.dot(csr_op1.dot(csr_op2.T.dot(seq_evecs)))))))
+            Mv = diag.dot(csr_op2.dot(csr_op1.dot(csr_op2.T.dot(seq_evecs))))
+        
+        seq_evals = np.sum(seq_evecs * Mv, axis=0)
+        del Mv
+
+        order = np.argsort(-seq_evals)
 
         seq_evecs = seq_evecs[:,order]
-        seq_evals = evals[order]
+        seq_evals = seq_evals[order]
         triv_eig_indices = get_triv_status(seq_evecs)
-
+        triv_eig_indices += (seq_evals >= 1)
         seq_evecs = seq_evecs[:,~triv_eig_indices][:,:k]
-        seq_evals = evals[~triv_eig_indices][:k]
+        seq_evals = seq_evals[~triv_eig_indices][:k]
 
         krylov_iter += 1
         sysOps.throw_status('Trivial indices ' + str(np.where(triv_eig_indices)[0]) + ' removed.')
 
-    np.save(sysOps.globaldatapath + 'evecs.npy',seq_evecs)
+    np.save(sysOps.globaldatapath + 'init_evecs.npy',seq_evecs)
     np.save(sysOps.globaldatapath + 'evals.npy',seq_evals)
     return
+
+
+
+
+
 
 class GSEobj:
     # object for all image inference
@@ -2779,7 +4860,9 @@ class GSEobj:
         self.dXpts = None
         self.gl_diag = None
         self.gl_innerprod = None
-        
+        self.alphas_arr = None
+        self.Ls_arr = None
+
         if inference_dim is None:
             self.spat_dims = 2 # default
         else:
@@ -2795,7 +4878,9 @@ class GSEobj:
         self.load_data() # requires inputted value of Npt_tp1 if inp_data = None
     
         sysOps.throw_status('Done.')
-        
+
+
+
 
     def load_data(self):
         # Load raw link data from link_assoc.txt
@@ -2828,19 +4913,6 @@ class GSEobj:
             
         # Primary (legacy) sparse link matrix: typically bipartite and stored one-way.
         self.link_data = load_npz(self.path + "link_assoc_reindexed.npz").tocsr()
-        
-        csr = self.link_data
-        csr += csr.T
-        csr_base_rowsum = np.array(csr.astype(bool).sum(axis=1)).flatten()
-        csr_base_rownorm_alpha = np.array(csr.astype(bool).sum(axis=1)).flatten()
-        alpha = 2
-        for _ in range(1,alpha):
-            csr_base_rownorm_alpha = scipy.sparse.diags(1.0/csr_base_rowsum) @ (csr.astype(bool) @ csr_base_rownorm_alpha)
-        print(str(csr_base_rownorm_alpha))
-        self.link_data = scipy.sparse.triu(scipy.sparse.diags(np.sqrt(csr_base_rownorm_alpha)) @ csr @  scipy.sparse.diags(np.sqrt(csr_base_rownorm_alpha)))
-        del csr
-        
-        self.Npts = int(max(self.index_key.shape[0], self.link_data.shape[0]))
 
         self.Npts = int(self.link_data.shape[0])
     
@@ -2866,7 +4938,7 @@ class GSEobj:
         return
     
     
-    def eigen_decomp(self,orth=False, pmax=None, rev_operator=False):
+    def eigen_decomp(self,orth=False, pmax=None, rank_transform=False):
     # Assemble linear manifold from data using "local linearity" assumption
     # assumes link_data type-1- and type-2-indices at this point has non-overlapping indices
         if self.seq_evecs is not None:
@@ -2874,10 +4946,7 @@ class GSEobj:
             self.seq_evecs = None
         if pmax == 1:
             csr_op2 = load_npz(sysOps.globaldatapath + 'transformed_matrix.npz')
-            if rev_operator:
-                csr_op2 += csr_op2.T
-            else:
-                csr_op2 = scipy.sparse.diags(np.power(np.array(csr_op2.sum(axis=1)).flatten()+1E-20,-1)).dot(csr_op2)
+            csr_op2 = scipy.sparse.diags(np.power(np.array(csr_op2.sum(axis=1)).flatten()+1E-20,-1)).dot(csr_op2)
         else:
             csr_op2 = None
         csr_op1 = (self.link_data + self.link_data.T).tocsr()
@@ -2898,23 +4967,40 @@ class GSEobj:
             pass
 
         generate_fast_preorthbasis(csr_op1, self.inference_eignum)
-        get_eigs(csr_op1=csr_op1,k=self.inference_eignum,csr_op2=csr_op2,rev_operator=rev_operator)
-
+        if not sysOps.check_file_exists('init_evecs.npy'):
+            get_eigs(csr_op1=csr_op1,k=self.inference_eignum,csr_op2=csr_op2)
+        del csr_op1, csr_op2
         
-        self.seq_evecs = np.load(sysOps.globaldatapath + 'evecs.npy')
-        if orth:
+        self.seq_evecs = np.load(sysOps.globaldatapath + 'init_evecs.npy')
+        if rank_transform: # will automatically orthogonalize
+            if not sysOps.check_file_exists('rank_evecs.npy'):
+                self.seq_evecs -= np.mean(self.seq_evecs,axis=0)
+                self.seq_evecs = rank_rotation_embedding(self.seq_evecs.dot(np.diag(1.0/np.maximum(1E-20,np.sqrt(1-np.load(sysOps.globaldatapath + "evals.npy"))))))
+                self.seq_evecs -= np.mean(self.seq_evecs,axis=0)
+                self.seq_evecs /= LA.norm(self.seq_evecs,axis=0)
+                np.save(sysOps.globaldatapath + 'rank_evecs.npy',self.seq_evecs)
+            del self.seq_evecs
+            interleave_concat(sysOps.globaldatapath + 'rank_evecs.npy',sysOps.globaldatapath + 'init_evecs.npy',sysOps.globaldatapath + 'new_evecs.npy',self.spat_dims)
+            os.remove(sysOps.globaldatapath + 'init_evecs.npy')
+            os.remove(sysOps.globaldatapath + 'rank_evecs.npy')
+            self.seq_evecs = orth_preserve_order(np.load(sysOps.globaldatapath + 'new_evecs.npy'))
+            os.remove(sysOps.globaldatapath + 'new_evecs.npy')
+            np.save(sysOps.globaldatapath + 'evecs.npy',self.seq_evecs)
+        elif orth:
             self.seq_evecs = orth_preserve_order(self.seq_evecs)
             np.save(sysOps.globaldatapath + 'evecs.npy',self.seq_evecs)
-
+            os.remove(sysOps.globaldatapath + 'init_evecs.npy')
+        else:
+            os.rename(sysOps.globaldatapath + 'init_evecs.npy',sysOps.globaldatapath + 'evecs.npy')
         self.seq_evecs = self.seq_evecs.T
         return True
     
+        
     def reset_gaussian_parameteres(self, Xpts, K=1):
         sysOps.throw_status("Beginning bimodal fit ...")
             
         self.alphas_arr, self.Ls_arr, opt = fit_decay_multi_scale(self.link_data + self.link_data.T, Xpts, K)
         sysOps.throw_status("Performed bimodal fit, (alpha, L): " + str([self.alphas_arr,self.Ls_arr]))
-        
     def calc_grad(self,X):
     
         return self.calc_grad_and_hessp(X,None)
@@ -2948,7 +5034,7 @@ class GSEobj:
                 csr_op2 = csr_op2 + scipy.sparse.diags(np.ones(csr_op2.shape[0],dtype=np.float64)*1E-10)
                 csr_op2 = scipy.sparse.diags(np.power(np.array(csr_op2.sum(axis=1)).flatten()+1E-20,-1)).dot(csr_op2)
             
-                csr =  dot2(csr_op1,csr_op2,rownorm=False)
+                csr = dot2(csr_op1, csr_op2)
             
             vals = csr.dot(np.ones(self.Npts, dtype=np.float64))
             
@@ -2959,7 +5045,7 @@ class GSEobj:
             self.gl_innerprod = self.seq_evecs.dot(csr.dot(self.seq_evecs.T))
             sysOps.throw_status('Calculating self.gl_diag')
             self.gl_diag      = self.seq_evecs.dot(scipy.sparse.diags(vals).dot(self.seq_evecs.T))
-            del csr
+            del vals, csr
 
             self.sub_pairing_count = 2 * (self.spat_dims + 1)
             self.hashings          = max(1, int(NTHREADS))
@@ -2967,10 +5053,9 @@ class GSEobj:
             if Pmax_est == 0 and self.Npts > 0 : Pmax_est = self.Npts * 10
             if self.Npts == 0: Pmax_est = 1 # Avoid zero-size array for w_buff if Npts is 0
 
-            self.w_buff      = np.zeros((Pmax_est, self.spat_dims + 1), np.float64)
+            self.w_buff      = np.zeros((Pmax_est, self.spat_dims), np.float64)
             self.dXpts_buff  = np.zeros((self.Npts, self.spat_dims, self.hashings), np.float64)
             self.hessp_buff  = np.zeros_like(self.dXpts_buff)
-            self.work_vec    = np.zeros(self.spat_dims, np.float64)
             self.sumw        = 0.0
             # Bucketing state (populated when pairings are ready)
             self._pair_sorted = None
@@ -3034,9 +5119,9 @@ class GSEobj:
 
             P_actual = self.subsample_pairings.shape[0]
             if self.w_buff.shape[0] < P_actual:
-                self.w_buff = np.zeros((P_actual, self.spat_dims + 1), np.float64)
+                self.w_buff = np.zeros((P_actual, self.spat_dims), np.float64)
             elif P_actual == 0: # Ensure w_buff is at least 1 for Numba if P_actual is 0
-                 self.w_buff = np.zeros((1, self.spat_dims + 1), np.float64) # Or handle P_actual=0 in Numba
+                 self.w_buff = np.zeros((1, self.spat_dims), np.float64) # Or handle P_actual=0 in Numba
             else:
                 self.w_buff = self.w_buff[:P_actual, :]
             self._pair_sorted   = None
@@ -3045,7 +5130,7 @@ class GSEobj:
         elif self.Npts == 0 : # No points, no pairings
              self.subsample_pairings = np.empty((0,2), dtype=np.int32)
              self.subsample_pairing_weights = np.empty((0,), dtype=np.float64)
-             self.w_buff = np.zeros((1, self.spat_dims + 1), np.float64)
+             self.w_buff = np.zeros((1, self.spat_dims), np.float64)
              self._pair_sorted   = None
              self._wt_sorted     = None
              self._pair_offsets  = None
@@ -3056,7 +5141,7 @@ class GSEobj:
 
         if P_actual == 0 and self.Npts > 0 : # if pairings became empty unexpectedly
              # Fallback for w_buff if P_actual is 0 but we might proceed
-             self.w_buff = np.zeros((1, self.spat_dims + 1), np.float64)
+             self.w_buff = np.zeros((1, self.spat_dims), np.float64)
 
         # --- Bucketing: ensure we have plane-partitioned pairs/weights ---
         if P_actual > 0 and (self._pair_sorted is None or
@@ -3067,9 +5152,9 @@ class GSEobj:
 
         if do_grad:
             if self.w_buff.shape[0] < P_actual and P_actual > 0:
-                 self.w_buff = np.zeros((P_actual, self.spat_dims + 1), np.float64)
+                 self.w_buff = np.zeros((P_actual, self.spat_dims), np.float64)
             elif P_actual == 0: # Ensure w_buff is at least size 1 for Numba if P_actual is 0
-                 if self.w_buff.shape[0] < 1: self.w_buff = np.zeros((1, self.spat_dims + 1), np.float64)
+                 if self.w_buff.shape[0] < 1: self.w_buff = np.zeros((1, self.spat_dims), np.float64)
 
 
             if P_actual > 0 :
@@ -3094,7 +5179,7 @@ class GSEobj:
                     self._pair_sorted, self._wt_sorted, self._pair_offsets,
                     self.w_buff,
                     self.dXpts_buff[:, :, 0],
-                    self.work_vec, inp_pts, self.sumw,
+                    inp_pts, self.sumw,
                     P_actual, self.spat_dims, self.Npts, self.hashings,
                     self.alphas_arr, invL2_arr, invL4_arr)
             else:
@@ -3145,36 +5230,24 @@ class GSEobj:
     def _ensure_pair_buckets(self):
         """
         Build plane buckets so each thread processes a contiguous slice.
-        Uses modulo hashing to avoid dropping pairs when H is not a power of two.
-        If you must exactly emulate old bitmask partitioning, set USE_COMPAT_MASK=True.
+        Uses modulo hashing so every pairing is assigned to exactly one plane.
         """
         pair = np.ascontiguousarray(self.subsample_pairings, dtype=np.int32)
-        wt   = np.ascontiguousarray(self.subsample_pairing_weights, dtype=np.float64)
-        H    = int(self.hashings)
+        wt = np.ascontiguousarray(self.subsample_pairing_weights, dtype=np.float64)
+        H = int(self.hashings)
 
-        USE_COMPAT_MASK = False  # set True to reproduce old bitmask-based plane assignment
-        if USE_COMPAT_MASK:
-            # Old logic: ((k+j) & hmask). WARNING: drops pairs if H is not a power of two.
-            mask = 1
-            while mask < H: mask <<= 1
-            hmask = mask - 1
-            planes = ((pair[:, 0] + pair[:, 1]) & hmask).astype(np.int64)
-            # Clip to [0, H-1] so we don't overrun; this mimics old behavior that *ignored* those pairs.
-            planes = np.minimum(planes, H - 1)
-        else:
-            # Correct, collision-uniform plane assignment
-            planes = ((pair[:, 0] + pair[:, 1]) % H).astype(np.int64)
+        planes = ((pair[:, 0] + pair[:, 1]) % H).astype(np.int64)
 
         counts = np.bincount(planes, minlength=H).astype(np.int64)
         offsets = np.empty(H + 1, dtype=np.int64)
         offsets[0] = 0
         np.cumsum(counts, out=offsets[1:])
         pair_sorted = np.empty_like(pair)
-        wt_sorted   = np.empty_like(wt)
+        wt_sorted = np.empty_like(wt)
         _bucket_pairs_stable(pair, wt, planes, offsets, pair_sorted, wt_sorted)
-        self._pair_sorted   = pair_sorted
-        self._wt_sorted     = wt_sorted
-        self._pair_offsets  = offsets
+        self._pair_sorted = pair_sorted
+        self._wt_sorted = wt_sorted
+        self._pair_offsets = offsets
 
 @njit(
     "void(int32[:,:], float64[:], int64[:], int64[:], int32[:,:], float64[:])",
@@ -3196,128 +5269,8 @@ def _bucket_pairs_stable(pair, wt, planes, offsets, out_pair, out_wt):
 
 
 @njit(
-    "float64(int32[:,:], float64[:], int64[:], float64[:,:], float64[:,:,:], "
-    "float64[:,:], int64, int64, int64, int64, float64[:], float64[:])",
+    "float64[:](float64[:], float64[:], float64[:], float64[:])",
     fastmath=True, parallel=True, cache=True)
-def get_dxpts_bucketed(pair_sorted, wt_sorted, offsets, wbuf, dX, X,
-                       P, D, N, H, alphas, invL2):
-    # zero output planes efficiently
-    for n_idx in prange(N):
-        for d_idx in range(D):
-            for h_idx in range(H):
-                dX[n_idx, d_idx, h_idx] = 0.0
-    sumw_global = 0.0
-    thread_sumws = np.zeros(H, dtype=np.float64)
-    for h in prange(H):
-        start = offsets[h]
-        stop  = offsets[h+1]
-        sw_local_to_h = 0.0
-        for p in range(start, stop):
-            k = pair_sorted[p, 0]
-            j = pair_sorted[p, 1]
-            diff_sq = 0.0
-            for d_coord in range(D):
-                dv = X[k, d_coord] - X[j, d_coord]
-                wbuf[p, d_coord] = dv
-                diff_sq += dv * dv
-            wsum_mix_exp = 0.0
-            wdot_mix_exp_L2 = 0.0
-            for m_idx in range(alphas.size):
-                w_component = alphas[m_idx] * math.exp(-diff_sq * invL2[m_idx])
-                wsum_mix_exp += w_component
-                wdot_mix_exp_L2 += invL2[m_idx] * w_component
-            wt_pair_user = wt_sorted[p]
-            wmix_final = wt_pair_user * wsum_mix_exp
-            wbuf[p, D] = wmix_final  # keep for compatibility (not read by Hessian)
-            sw_local_to_h += wmix_final
-            gfac = -2.0 * wt_pair_user * wdot_mix_exp_L2
-            for d_coord in range(D):
-                g_val = gfac * wbuf[p, d_coord]
-                dX[k, d_coord, h] += g_val
-                dX[j, d_coord, h] -= g_val
-        thread_sumws[h] = sw_local_to_h
-    for h_idx in range(H):
-        sumw_global += thread_sumws[h_idx]
-    # Reduce all planes into plane 0 in a single pass (parallel over nodes)
-    for n_idx in prange(N):
-        for d_coord in range(D):
-            s = dX[n_idx, d_coord, 0]
-            for h_idx in range(1, H):
-                s += dX[n_idx, d_coord, h_idx]
-            dX[n_idx, d_coord, 0] = s
-    return sumw_global
-
-@njit(
-    "void(float64[:,:,:], int32[:,:], float64[:], int64[:], float64[:,:], "
-    "float64[:,:], float64[:], float64[:,:], float64, "
-    "int64, int64, int64, int64, float64[:], float64[:], float64[:])",
-    fastmath=True, parallel=True, cache=True)
-def get_hessp_bucketed(out, pair_sorted, wt_sorted, offsets, wbuf,
-                       grad_sum_dxpts, tmp_work_vec, v_pts, sumw_total,
-                       P, D, N, H, alphas, invL2, invL4):
-    # zero output planes
-    for n_idx in prange(N):
-        for d_idx in range(D):
-            for h_idx in range(H):
-                out[n_idx, d_idx, h_idx] = 0.0
-    for h_plane_idx in prange(H):
-        start = offsets[h_plane_idx]
-        stop  = offsets[h_plane_idx+1]
-        for p_idx in range(start, stop):
-            k_node = pair_sorted[p_idx, 0]
-            j_node = pair_sorted[p_idx, 1]
-            diff_sq_val = 0.0
-            for d_coord in range(D):
-                dv = wbuf[p_idx, d_coord]
-                diff_sq_val += dv * dv
-            wsum_mix_exp = 0.0
-            gamma_sum = 0.0
-            beta_sum  = 0.0
-            for m_idx in range(alphas.size):
-                w_component = alphas[m_idx] * math.exp(-diff_sq_val * invL2[m_idx])
-                wsum_mix_exp += w_component
-                gamma_sum += invL2[m_idx] * w_component
-                beta_sum  += invL4[m_idx] * w_component
-            wt_pair_user = wt_sorted[p_idx]
-            coeff_hsec = wt_pair_user
-            for d1_coord in range(D):
-                delta_X_d1 = wbuf[p_idx, d1_coord]
-                acc_k_val = 0.0
-                acc_j_val = 0.0
-                for d2_coord in range(D):
-                    is_diagonal_term = 1.0 if d1_coord == d2_coord else 0.0
-                    delta_X_d2 = wbuf[p_idx, d2_coord]
-                    hsec_bracket_val = coeff_hsec * (
-                        4.0 * beta_sum * delta_X_d1 * delta_X_d2 -
-                        2.0 * gamma_sum * is_diagonal_term)
-                    delta_v_d2 = v_pts[j_node, d2_coord] - v_pts[k_node, d2_coord]
-                    acc_k_val += hsec_bracket_val * delta_v_d2
-                    acc_j_val += hsec_bracket_val * (-delta_v_d2)
-                out[k_node, d1_coord, h_plane_idx] += acc_k_val
-                out[j_node, d1_coord, h_plane_idx] += acc_j_val
-    inv_sumw_total = 1.0 / (sumw_total + 1e-12)
-    for n_idx in prange(N):
-       for d_coord in range(D):
-            sum_over_h_planes = 0.0
-            for h_idx in range(H):
-               sum_over_h_planes += out[n_idx, d_coord, h_idx]
-            out[n_idx, d_coord, 0] = sum_over_h_planes * inv_sumw_total
-    total_dot_product_grad_v = 0.0
-    for n_idx in range(N):
-        for d_coord in range(D):
-            total_dot_product_grad_v += grad_sum_dxpts[n_idx, d_coord] * v_pts[n_idx, d_coord]
-    cross_term_coeff = inv_sumw_total * inv_sumw_total * total_dot_product_grad_v
-    for n_idx in prange(N):
-        for d_coord in range(D):
-            out[n_idx, d_coord, 0] += grad_sum_dxpts[n_idx, d_coord] * cross_term_coeff
-
-from numpy.random import default_rng
-from scipy.optimize import minimize
-
-# ---------------------------------------------------------------------
-#  Vectorised two‑scale radial kernel
-# ---------------------------------------------------------------------
-
 def _kernel_vec_multi(r: np.ndarray,
                       shell: np.ndarray,
                       alphas: np.ndarray,
@@ -3325,23 +5278,32 @@ def _kernel_vec_multi(r: np.ndarray,
     """
     Radial kernel
 
-        w(r) = r^(d‑1) · Σ_k  α_k · exp(‑r² / L_k²)
-
-    broadcast‑vectorised for r.shape == shell.shape.
+        w(r) = r^(d-1) * sum_k alpha_k * exp(-r^2 / L_k^2)
 
     Parameters
     ----------
-    r, shell : 1‑D arrays  (same shape)
-    alphas   : (K,) non‑negative, usually summing to 1
-    Ls       : (K,) positive
+    r, shell : 1-D float64 arrays with the same length
+    alphas   : 1-D float64 array of mixture weights
+    Ls       : 1-D float64 array of positive length scales
 
     Returns
     -------
-    w : 1‑D array  (same shape as r)
+    out : 1-D float64 array with the same length as r
     """
-    # r[:,None] → (n,1)  so broadcasting over K
-    gaussians = np.exp(- (r[:, None] ** 2) / (Ls[None, :] ** 2))      # (n,K)
-    return shell * (gaussians @ alphas)                               # (n,)
+    n = r.shape[0]
+    K = alphas.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    for i in prange(n):
+        r2 = r[i] * r[i]
+        acc = 0.0
+        for k in range(K):
+            L = Ls[k]
+            denom = L * L
+            if denom <= 0.0:
+                denom = 1.0e-300
+            acc += alphas[k] * math.exp(-r2 / denom)
+        out[i] = shell[i] * acc
+    return out
 
 def _idx_to_pair(idx: np.ndarray, N: int) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -3376,15 +5338,6 @@ def _idx_to_pair(idx: np.ndarray, N: int) -> tuple[np.ndarray, np.ndarray]:
     #     raise RuntimeError("Internal error in _idx_to_pair")
 
     return i, j
-
-
-# ---------------------------------------------------------------------
-#  Main fitting routine
-# ---------------------------------------------------------------------
-from numpy.random import default_rng
-from scipy.optimize import minimize
-
-# ---------- include _idx_to_pair from the previous answer here ------------
 
 def fit_decay_multi_scale(csr_counts: csr_matrix,
                           coords: np.ndarray,
@@ -3426,7 +5379,7 @@ def fit_decay_multi_scale(csr_counts: csr_matrix,
     N_ij  = coo.data[mask].astype(np.float64)
 
     r_obs = np.linalg.norm(coords[i_obs] - coords[j_obs], axis=1).clip(min=dist_eps)
-    shell_obs = 1.0 if d == 1 else r_obs ** (d - 1)
+    shell_obs = np.ones_like(r_obs) if d == 1 else r_obs ** (d - 1)
     N_tot = N_ij.sum()
 
     # ---------- 2. Monte‑Carlo panel for Σ w ------------------------
@@ -3435,7 +5388,7 @@ def fit_decay_multi_scale(csr_counts: csr_matrix,
     i_samp, j_samp = _idx_to_pair(flat_idx, N)
 
     r_samp     = np.linalg.norm(coords[i_samp] - coords[j_samp], axis=1).clip(min=dist_eps)
-    shell_samp = 1.0 if d == 1 else r_samp ** (d - 1)
+    shell_samp = np.ones_like(r_samp) if d == 1 else r_samp ** (d - 1)
     pair_scale = total_pairs / sample_pairs
 
     # ---------- 3.  Parameterisation --------------------------------
@@ -3489,5 +5442,119 @@ def fit_decay_multi_scale(csr_counts: csr_matrix,
 
     alphas_hat, Ls_hat = unpack(result.x)
     return alphas_hat, Ls_hat, result
+
+
+@njit(
+    "float64(int32[:,:], float64[:], int64[:], float64[:,:], float64[:,:,:], "
+    "float64[:,:], int64, int64, int64, int64, float64[:], float64[:])",
+    fastmath=True, parallel=True, cache=True)
+def get_dxpts_bucketed(pair_sorted, wt_sorted, offsets, wbuf, dX, X,
+                       P, D, N, H, alphas, invL2):
+    # zero output planes efficiently
+    for n_idx in prange(N):
+        for d_idx in range(D):
+            for h_idx in range(H):
+                dX[n_idx, d_idx, h_idx] = 0.0
+    sumw_global = 0.0
+    thread_sumws = np.zeros(H, dtype=np.float64)
+    for h in prange(H):
+        start = offsets[h]
+        stop  = offsets[h+1]
+        sw_local_to_h = 0.0
+        for p in range(start, stop):
+            k = pair_sorted[p, 0]
+            j = pair_sorted[p, 1]
+            diff_sq = 0.0
+            for d_coord in range(D):
+                dv = X[k, d_coord] - X[j, d_coord]
+                wbuf[p, d_coord] = dv
+                diff_sq += dv * dv
+            wsum_mix_exp = 0.0
+            wdot_mix_exp_L2 = 0.0
+            for m_idx in range(alphas.size):
+                w_component = alphas[m_idx] * math.exp(-diff_sq * invL2[m_idx])
+                wsum_mix_exp += w_component
+                wdot_mix_exp_L2 += invL2[m_idx] * w_component
+            wt_pair_user = wt_sorted[p]
+            wmix_final = wt_pair_user * wsum_mix_exp
+            sw_local_to_h += wmix_final
+            gfac = -2.0 * wt_pair_user * wdot_mix_exp_L2
+            for d_coord in range(D):
+                g_val = gfac * wbuf[p, d_coord]
+                dX[k, d_coord, h] += g_val
+                dX[j, d_coord, h] -= g_val
+        thread_sumws[h] = sw_local_to_h
+    for h_idx in range(H):
+        sumw_global += thread_sumws[h_idx]
+    # Reduce all planes into plane 0 in a single pass (parallel over nodes)
+    for n_idx in prange(N):
+        for d_coord in range(D):
+            s = dX[n_idx, d_coord, 0]
+            for h_idx in range(1, H):
+                s += dX[n_idx, d_coord, h_idx]
+            dX[n_idx, d_coord, 0] = s
+    return sumw_global
+
+@njit(
+    "void(float64[:,:,:], int32[:,:], float64[:], int64[:], float64[:,:], "
+    "float64[:,:], float64[:,:], float64, "
+    "int64, int64, int64, int64, float64[:], float64[:], float64[:])",
+    fastmath=True, parallel=True, cache=True)
+def get_hessp_bucketed(out, pair_sorted, wt_sorted, offsets, wbuf,
+                       grad_sum_dxpts, v_pts, sumw_total,
+                       P, D, N, H, alphas, invL2, invL4):
+    # zero output planes
+    for n_idx in prange(N):
+        for d_idx in range(D):
+            for h_idx in range(H):
+                out[n_idx, d_idx, h_idx] = 0.0
+    for h_plane_idx in prange(H):
+        start = offsets[h_plane_idx]
+        stop  = offsets[h_plane_idx+1]
+        for p_idx in range(start, stop):
+            k_node = pair_sorted[p_idx, 0]
+            j_node = pair_sorted[p_idx, 1]
+            diff_sq_val = 0.0
+            for d_coord in range(D):
+                dv = wbuf[p_idx, d_coord]
+                diff_sq_val += dv * dv
+            gamma_sum = 0.0
+            beta_sum  = 0.0
+            for m_idx in range(alphas.size):
+                w_component = alphas[m_idx] * math.exp(-diff_sq_val * invL2[m_idx])
+                gamma_sum += invL2[m_idx] * w_component
+                beta_sum  += invL4[m_idx] * w_component
+            wt_pair_user = wt_sorted[p_idx]
+            coeff_hsec = wt_pair_user
+            for d1_coord in range(D):
+                delta_X_d1 = wbuf[p_idx, d1_coord]
+                acc_k_val = 0.0
+                acc_j_val = 0.0
+                for d2_coord in range(D):
+                    is_diagonal_term = 1.0 if d1_coord == d2_coord else 0.0
+                    delta_X_d2 = wbuf[p_idx, d2_coord]
+                    hsec_bracket_val = coeff_hsec * (
+                        4.0 * beta_sum * delta_X_d1 * delta_X_d2 -
+                        2.0 * gamma_sum * is_diagonal_term)
+                    delta_v_d2 = v_pts[j_node, d2_coord] - v_pts[k_node, d2_coord]
+                    acc_k_val += hsec_bracket_val * delta_v_d2
+                    acc_j_val += hsec_bracket_val * (-delta_v_d2)
+                out[k_node, d1_coord, h_plane_idx] += acc_k_val
+                out[j_node, d1_coord, h_plane_idx] += acc_j_val
+    inv_sumw_total = 1.0 / (sumw_total + 1e-12)
+    for n_idx in prange(N):
+       for d_coord in range(D):
+            sum_over_h_planes = 0.0
+            for h_idx in range(H):
+               sum_over_h_planes += out[n_idx, d_coord, h_idx]
+            out[n_idx, d_coord, 0] = sum_over_h_planes * inv_sumw_total
+    total_dot_product_grad_v = 0.0
+    for n_idx in range(N):
+        for d_coord in range(D):
+            total_dot_product_grad_v += grad_sum_dxpts[n_idx, d_coord] * v_pts[n_idx, d_coord]
+    cross_term_coeff = inv_sumw_total * inv_sumw_total * total_dot_product_grad_v
+    for n_idx in prange(N):
+        for d_coord in range(D):
+            out[n_idx, d_coord, 0] += grad_sum_dxpts[n_idx, d_coord] * cross_term_coeff
 
 

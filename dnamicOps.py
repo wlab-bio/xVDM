@@ -967,8 +967,33 @@ def get_amp_consensus(seq_terminate_list,
         if uei_matchfilepath is not None:
             uei_paths = [p for p in str(uei_matchfilepath).split('+') if p]
             for amp_ind in range(2):
-                # Ensure clust→(UMI seq, uniq-seq index) table exists
                 clust_sort_clust_path = gd + f"clust_sort_clust_uxi{amp_ind}.txt"
+
+                # Only attempt UEI matching for amp-indices that actually exist in this library.
+                # This matters for cDNA-only runs, which often generate amp0/uxi0 but not amp1/uxi1.
+                src_assign = os.path.join(gd, f"sorted_umi_seq_assignments{amp_ind}.txt")
+                src_max    = os.path.join(gd, f"max_base_use_uxi{amp_ind}.txt")
+                src_map    = os.path.join(gd, f"seq_sort_clust_uxi{amp_ind}.txt")
+
+                missing_local = []
+                if not os.path.exists(src_assign):
+                    missing_local.append(os.path.basename(src_assign))
+                if not os.path.exists(clust_sort_clust_path):
+                    for p in (src_max, src_map):
+                        if not os.path.exists(p):
+                            missing_local.append(os.path.basename(p))
+
+                if missing_local:
+                    sysOps.throw_status(
+                        "STAGE 5: Skipping UEI match for amp"
+                        + str(amp_ind)
+                        + " (missing local source files: "
+                        + ", ".join(missing_local)
+                        + ")."
+                    )
+                    continue
+
+                # Ensure clust→(UMI seq, uniq-seq index) table exists
                 if not sysOps.check_file_exists(f"clust_sort_clust_uxi{amp_ind}.txt"):
                     seqindex_sorted_uxi_path = gd + f"seqindex_sorted_uxi_{amp_ind}.txt"
                     tmp_seq_sort_clust_path  = gd + f"tmp_seq_sort_clust_uxi{amp_ind}.txt"
@@ -988,19 +1013,32 @@ def get_amp_consensus(seq_terminate_list,
                         pass
 
                 for uei_path in uei_paths:
+                    uei_out_dir = os.path.join(gd, uei_path)
+                    out_label   = os.path.join(uei_out_dir, f"label_pt{amp_ind}.txt")
+                    in_assign   = os.path.join(gd, f"sorted_umi_seq_assignments{amp_ind}.txt")
+                    in_max      = os.path.join(uei_out_dir, f"max_base_use_uxi{amp_ind}.txt")
+                    in_map      = os.path.join(uei_out_dir, f"seq_sort_clust_uxi{amp_ind}.txt")
+
+                    missing_target = [
+                        os.path.basename(p)
+                        for p in (in_max, in_map)
+                        if not os.path.exists(p)
+                    ]
+                    if missing_target:
+                        sysOps.throw_status(
+                            "STAGE 5: Skipping UEI match amp"
+                            + str(amp_ind)
+                            + " -> "
+                            + str(uei_out_dir)
+                            + " (missing target UEI files: "
+                            + ", ".join(missing_target)
+                            + ")."
+                        )
+                        continue
+
                     # Skip if label_pt is already up-to-date for this (amp_ind, uei_path)
                     try:
-                        uei_out_dir = os.path.join(gd, uei_path)
-                        out_label   = os.path.join(uei_out_dir, f"label_pt{amp_ind}.txt")
-                        in_assign   = os.path.join(gd, f"sorted_umi_seq_assignments{amp_ind}.txt")
-                        in_max      = os.path.join(uei_out_dir, f"max_base_use_uxi{amp_ind}.txt")
-                        in_map      = os.path.join(uei_out_dir, f"seq_sort_clust_uxi{amp_ind}.txt")
-                        if (
-                            os.path.exists(out_label)
-                            and os.path.exists(in_assign)
-                            and os.path.exists(in_max)
-                            and os.path.exists(in_map)
-                        ):
+                        if os.path.exists(out_label):
                             newest_in = max(
                                 os.path.getmtime(in_assign),
                                 os.path.getmtime(in_max),
@@ -1016,7 +1054,7 @@ def get_amp_consensus(seq_terminate_list,
 
                     # 1) Build UEI dataset UMI→(uniq_idx,cluster,UEI_readcount)
                     # Normalize RHS file (from UEI dataset) to avoid CRLF join issues
-                    rhs = gd + uei_path + f"seq_sort_clust_uxi{amp_ind}.txt"
+                    rhs = in_map
                     sysOps.sh(
                         f"tr -d '\\r' < {shlex.quote(rhs)} > {shlex.quote(rhs + '.nocr')} && "
                         f"mv {shlex.quote(rhs + '.nocr')} {shlex.quote(rhs)}"
@@ -1430,7 +1468,7 @@ def sl_clust_assoc(out_file, filter_if_umis_labeled = False, top_grps = 10, min_
     max_all_index = int(np.max(uei_assoc[:,1]))
     index_link_array = np.arange(max_all_index+1,dtype=np.int64)
     sysOps.throw_status('Performing SL clustering ...')
-    optimOps.min_contig_edges(index_link_array,np.ones(max_all_index+1,dtype=np.int64),uei_assoc,uei_assoc.shape[0])
+    optimOps.min_contig_edges(index_link_array,np.ones(max_all_index+1,dtype=np.int64),uei_assoc)
     uei_assoc[:,1] -= max_umi1_index+1
     sysOps.throw_status('Completed SL clustering. Writing ...')
     unique_umi1 = np.unique(np.int64(uei_assoc[:,0]))

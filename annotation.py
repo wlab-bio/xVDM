@@ -67,37 +67,22 @@ def build_umi_gene_anndata(
     include_obs_strings: bool = False,
 ):
     """
-    Builds an (n_obs x n_features) sparse one-hot (or sparse count) matrix mapping UEI nodes to features.
+    Build a sparse UMI/node-by-feature AnnData from label_pt files.
 
-    Assumes label_pt0.txt and label_pt1.txt exist (in group_path or a reachable parent directory).
-    Automatically aligns the raw_index scheme used by optimOps (true_raw indexing).
+    The builder finds ``label_pt0/1.txt`` (or legacy ``label_pts0/1.txt``),
+    maps raw UMI indices through ``index_key.npy``, and fills ``adata.X`` with
+    subcluster read support per gene feature, or binary support when
+    ``binary=True``. Large per-subcluster string columns are omitted by default
+    and can be retained with ``include_obs_strings=True``.
 
-    Patched output conventions (while keeping pipeline behavior otherwise identical):
-      • `adata.X` contains **subcluster read support** aggregated onto each feature (or 1s if binary=True).
-        Only subcluster read support (label_pt sub_reads_str) is used to populate X.
-      • The large per-subcluster strings from label_pt (`biotype_str`, `sub_reads_str`, `uei_reads_str`) are
-        used to build `adata.X` and totals, but are **not** stored in `adata.obs` (they were redundant and large).
-      • By default, we also do **not** store the other very large per-node label_pt string columns
-        (`aln_start_str`, `aln_mut_str`, `contig_str`, `gene_str`, `tx_str`) in `adata.obs`.
-        Set `include_obs_strings=True` if you explicitly want these strings preserved.
-      • `adata.var['feature_type']` reflects the inferred **biotype** for each gene feature (e.g. protein_coding,
-        rRNA, Mt_rRNA, genome). Sequence features (when enabled) are labelled as 'sequence'.
-      • Non-genic / non-annotated label_pt entries that use placeholder gene ID "NA" (biotype=genome) are converted
-        into contig-specific pseudo-features named "__genome__:<contig>" so they cannot be confused with real genes.
-        The contig is stored in `adata.var['contig']`.
+    When ``include_sequences=True`` and the label field looks like DNA sequence
+    rather than a query name, sequence features are added as ``SEQ:<sequence>``
+    columns and as a separate ``adata.layers['seq']`` matrix. Multi-mapping
+    genes are dropped unless ``include_nonunique_genes=True``.
 
-    If include_sequences=True (non-default) and label_pt column 9 looks like DNA/base4 sequences, we also:
-      - store the raw qname/seq field in obs['qname_or_seq_str'] and obs['seq_str'] (when detected)
-      - build a sequence one-hot matrix in `adata.layers['seq']`
-      - extend `adata.var` with sequence features named 'SEQ:<sequence>'
+    Returns an AnnData object when available and requested; otherwise returns
+    ``(X_gene, gene_names, obs_df)``.
 
-    Returns:
-        - If return_anndata and anndata is installed:
-            AnnData with:
-              * X: gene(+sequence feature space) matrix; gene features are populated, sequence columns are zeros.
-              * layers['seq'] (optional): sequence one-hot (only if include_sequences=True)
-        - Else:
-            (X_gene, gene_names, obs_df)
     """
     include_sequences = bool(include_sequences)
     include_nonunique_genes = bool(include_nonunique_genes)
@@ -142,7 +127,7 @@ def build_umi_gene_anndata(
     if label_root is None:
         label_root = group_path
 
-    label_pt_paths: list[str] = []
+    label_pt_sources: list[tuple[int, str]] = []
     for amp in (0, 1):
         candidates = (f"label_pt{amp}.txt", f"label_pts{amp}.txt")
         found = None
@@ -154,12 +139,23 @@ def build_umi_gene_anndata(
                 break
 
         if found is None:
-            raise FileNotFoundError(
-                f"Could not locate any of {candidates} starting from {label_root} or {group_path}"
+            sysOps.throw_status(
+                "Label file missing for amp " + str(amp) + "; continuing without it. "
+                + f"Tried {candidates} from {label_root} and {group_path}"
             )
-        else:
-            sysOps.throw_status("Found label path: " + str(found))
-        label_pt_paths.append(found)
+            continue
+
+        sysOps.throw_status("Found label path: " + str(found))
+        label_pt_sources.append((amp, found))
+
+    if not label_pt_sources:
+        raise FileNotFoundError(
+            "Could not locate any label_pt*.txt/label_pts*.txt starting from "
+            + str(label_root) + " or " + str(group_path)
+        )
+
+    label_pt_paths: list[str] = [p for (_amp, p) in label_pt_sources]
+
 
     # Determine whether label_pt files include the final UEI-reads column (10th column).
     # Some label formats (e.g. cDNA-only / older runs) may omit it.
@@ -296,8 +292,8 @@ def build_umi_gene_anndata(
                     pass
             return int(max(vals)) if vals else 1
 
-    # Iterate label_pt files (amp=0 and amp=1)
-    for amp, label_path in enumerate(label_pt_paths):
+    # Iterate whichever label_pt files were found, keeping their true amp indices.
+    for amp, label_path in label_pt_sources:
         # label_pt columns:
         # 0 raw_index
         # 1 aln_start_str (semicolon list)
@@ -543,6 +539,7 @@ def build_umi_gene_anndata(
             adata.layers["seq"] = X_seq
 
         adata.uns["label_pt_paths"] = label_pt_paths
+        adata.uns["label_pt_amps"] = [int(amp) for (amp, _path) in label_pt_sources]
         adata.uns["index_key_path"] = idx_path
         adata.uns["include_sequences"] = include_sequences
         adata.uns["include_nonunique_genes"] = include_nonunique_genes
