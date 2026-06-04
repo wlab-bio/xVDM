@@ -1,6 +1,6 @@
 # xVDM
 
-This repository contains the analysis code for cross-linked volumetric DNA microscopy (xVDM). xVDM converts paired cDNA and UEI sequencing libraries into a graph of molecular proximity, embeds the graph with Geodesic Spectral Embedding (GSE), calls connectivity-derived cells, and can register aggregate cells to a matched spatial reference.
+This repository contains the analysis code for cross-linked volumetric DNA microscopy (xVDM). The pipeline builds on an earlier pipeline that you can find <a href="https://github.com/wlab-bio/vdnamic">here</a>. xVDM converts paired cDNA and UEI sequencing libraries into a graph of molecular proximity, embeds the graph with Geodesic Spectral Embedding (GSE), calls connectivity-derived cells, and can register aggregate cells to a matched spatial reference.
 
 ## What is in the repository
 
