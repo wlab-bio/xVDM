@@ -32,12 +32,12 @@ OPTIONAL_PYTHON_MODULES = {
 
 EXECUTABLES = {
     "awk": "AWK helper scripts",
+    "bioawk": "FASTQ processing for library runs",
     "sort": "large file sorting",
     "gzip": "compressed intermediate files",
 }
 
 OPTIONAL_EXECUTABLES = {
-    "bioawk": "FASTQ processing on some library routes",
     "STAR": "genome alignment when requested by lib.settings",
     "infomap": "Infomap clustering executable",
 }
