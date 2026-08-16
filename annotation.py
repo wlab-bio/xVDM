@@ -1,6 +1,9 @@
 import os
 import csv
 import re
+import math
+import hashlib
+import subprocess
 import pandas as pd
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
@@ -54,6 +57,465 @@ def _find_upwards(start_path: str, filename: str, max_up: int = 6) -> str | None
             break
         p = parent
     return None
+
+
+def _int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return None
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return float(default)
+
+
+def _env_flag(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _format_bytes(n_bytes: int | float | None) -> str:
+    if n_bytes is None:
+        return "unknown"
+    value = float(max(0, n_bytes))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{value:.2f} TiB"
+
+
+def _affinity_cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except Exception:
+        return int(os.cpu_count() or 1)
+
+
+def _memory_limit_bytes() -> int | None:
+    """Best-effort memory limit for the current process/job/container."""
+    candidates: list[int] = []
+
+    explicit = _int_env("XVDM_CDNA_H5AD_MEMORY_LIMIT_BYTES")
+    if explicit is not None and explicit > 0:
+        candidates.append(int(explicit))
+
+    mem_node_mb = _int_env("SLURM_MEM_PER_NODE")
+    if mem_node_mb is not None and mem_node_mb > 0:
+        candidates.append(int(mem_node_mb) * 1024 * 1024)
+
+    mem_cpu_mb = _int_env("SLURM_MEM_PER_CPU")
+    if mem_cpu_mb is not None and mem_cpu_mb > 0:
+        candidates.append(int(mem_cpu_mb) * max(1, _affinity_cpu_count()) * 1024 * 1024)
+
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = open(path, "r", encoding="utf-8").read().strip()
+            if raw and raw != "max":
+                value = int(raw)
+                if 0 < value < (1 << 60):
+                    candidates.append(value)
+        except Exception:
+            pass
+
+    try:
+        import resource
+
+        for rsrc in (resource.RLIMIT_AS, resource.RLIMIT_DATA):
+            soft, _hard = resource.getrlimit(rsrc)
+            if soft is not None and soft > 0 and soft < (1 << 60):
+                candidates.append(int(soft))
+    except Exception:
+        pass
+
+    return min(candidates) if candidates else None
+
+
+def _available_memory_bytes() -> int | None:
+    """Best-effort currently available memory."""
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.check_output(["vm_stat"], text=True, stderr=subprocess.DEVNULL)
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        m = re.search(r"page size of (\d+) bytes", out)
+        if m:
+            page_size = int(m.group(1))
+
+        pages_available = 0
+        for line in out.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            if key not in {"Pages free", "Pages inactive", "Pages speculative"}:
+                continue
+            value = value.strip().rstrip(".").replace(".", "")
+            try:
+                pages_available += int(value)
+            except Exception:
+                pass
+        if pages_available > 0:
+            return int(pages_available * page_size)
+    except Exception:
+        pass
+
+    return None
+
+
+def _effective_memory_resource_bytes() -> int | None:
+    limit = _memory_limit_bytes()
+    available = _available_memory_bytes()
+    if limit is not None and available is not None:
+        return int(min(limit, available))
+    if limit is not None:
+        return int(limit)
+    if available is not None:
+        return int(available)
+    return None
+
+
+def _count_assignment_lines(assign_paths: list[tuple[int, str]]) -> int | None:
+    total = 0
+    for _amp_ind, path in assign_paths:
+        try:
+            out = subprocess.check_output(["wc", "-l", path], text=True, stderr=subprocess.DEVNULL)
+            total += int(out.strip().split()[0])
+        except Exception:
+            return None
+    return int(total)
+
+
+def _sequence_guard_max_len(max_sequence_len: int | None) -> int:
+    if max_sequence_len is None:
+        max_sequence_len = _int_env("XVDM_CDNA_H5AD_MAX_SEQUENCE_LEN")
+    if max_sequence_len is None or max_sequence_len <= 0:
+        # This is deliberately above standard short-read cDNA inserts. Callers
+        # with a checked read-length bound can pass it explicitly.
+        max_sequence_len = 512
+    return int(max(1, max_sequence_len))
+
+
+class _HyperLogLog:
+    """Small streaming cardinality estimator used by the cDNA sequence guard."""
+
+    def __init__(self, p: int = 14):
+        self.p = int(p)
+        self.m = 1 << self.p
+        self.registers = bytearray(self.m)
+
+    def add(self, value: str) -> None:
+        h = int.from_bytes(
+            hashlib.blake2b(str(value).encode("utf-8"), digest_size=8).digest(),
+            byteorder="big",
+            signed=False,
+        )
+        idx = h & (self.m - 1)
+        w = h >> self.p
+        width = 64 - self.p
+        rank = (width - w.bit_length() + 1) if w else (width + 1)
+        if rank > self.registers[idx]:
+            self.registers[idx] = rank
+
+    def count(self) -> int:
+        m = float(self.m)
+        if self.m == 16:
+            alpha = 0.673
+        elif self.m == 32:
+            alpha = 0.697
+        elif self.m == 64:
+            alpha = 0.709
+        else:
+            alpha = 0.7213 / (1.0 + 1.079 / m)
+
+        inv_sum = 0.0
+        zero_count = 0
+        for r in self.registers:
+            inv_sum += 2.0 ** (-int(r))
+            if r == 0:
+                zero_count += 1
+
+        estimate = alpha * m * m / inv_sum
+        if estimate <= 2.5 * m and zero_count > 0:
+            estimate = m * math.log(m / float(zero_count))
+        return int(max(0, round(estimate)))
+
+
+def _estimate_cdna_sequence_h5ad_memory_from_counts(
+    *,
+    n_records: int,
+    n_seq_entries: int,
+    unique_seq_est: int,
+    unique_node_est: int,
+    unique_gene_est: int,
+    avg_seq_len: float,
+    estimate_mode: str,
+) -> dict:
+    n_records = int(max(0, n_records))
+    n_seq_entries = int(max(0, n_seq_entries))
+    unique_seq_est = int(max(0, unique_seq_est))
+    unique_node_est = int(max(0, unique_node_est))
+    unique_gene_est = int(max(0, unique_gene_est))
+    avg_seq_len = float(max(0.0, avg_seq_len))
+
+    # Conservative working-set model:
+    # - base h5ad work: sparse triplets, obs/var frames, and AnnData writer overhead
+    # - sequence work: Python list/int staging, sequence dictionary, duplicate var-name
+    #   strings ("SEQ:<sequence>"), sparse layer, obs seq strings, and writer copies
+    base_bytes = (
+        512 * 1024 * 1024
+        + int(unique_node_est * 512)
+        + int(max(1, n_records) * 128)
+        + int(unique_gene_est * 1024)
+    )
+    sequence_bytes = (
+        int(max(1, n_seq_entries) * 192)
+        + int(max(1, unique_seq_est) * (1536 + 8 * max(1.0, avg_seq_len)))
+        + int(max(1, unique_node_est) * 128)
+    )
+
+    safety_factor = _float_env("XVDM_CDNA_H5AD_SEQUENCE_MEMORY_SAFETY_FACTOR", 2.0)
+    safety_factor = min(max(safety_factor, 1.0), 10.0)
+    estimated_total = int((base_bytes + sequence_bytes) * safety_factor)
+
+    return {
+        "estimate_mode": str(estimate_mode),
+        "n_records": int(n_records),
+        "n_seq_entries": int(n_seq_entries),
+        "unique_seq_est": int(unique_seq_est),
+        "unique_node_est": int(unique_node_est),
+        "unique_gene_est": int(unique_gene_est),
+        "avg_seq_len": float(avg_seq_len),
+        "base_bytes_estimate": int(base_bytes),
+        "sequence_bytes_estimate": int(sequence_bytes),
+        "safety_factor": float(safety_factor),
+        "estimated_total_bytes": int(estimated_total),
+    }
+
+
+def _estimate_cdna_sequence_h5ad_memory_streaming(assign_paths: list[tuple[int, str]]) -> dict:
+    """Estimate in-memory cost of building cDNA-only h5ad with sequence features.
+
+    The scan is streaming and uses HyperLogLog counters instead of exact sets.
+    The estimate is deliberately conservative because Python string, pandas,
+    scipy sparse, and AnnData write paths all create transient copies.
+    """
+    seq_hll = _HyperLogLog()
+    node_hll = _HyperLogLog()
+    gene_hll = _HyperLogLog()
+
+    n_records = 0
+    n_seq_entries = 0
+    total_seq_chars = 0
+
+    for amp_ind, ap in assign_paths:
+        try:
+            with open(ap, "r") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    parts = line.rstrip("\n").split(",", 9)
+                    if len(parts) < 10:
+                        continue
+
+                    rest = parts[9].strip()
+                    comma = rest.find(",")
+                    if comma != -1:
+                        qname = rest[:comma].strip()
+                        seq = rest[comma + 1 :].strip()
+                    else:
+                        qname = rest
+                        seq = ""
+
+                    if not qname:
+                        continue
+
+                    q0 = qname.split(":", 1)[0]
+                    raw_idx_str = q0.split(".", 1)[0]
+                    try:
+                        raw_idx = int(raw_idx_str)
+                    except ValueError:
+                        continue
+
+                    n_records += 1
+                    node_hll.add(f"{amp_ind}:{raw_idx}")
+
+                    gene_str = parts[5].strip()
+                    for gene in [t.strip() for t in gene_str.split("|") if t.strip()]:
+                        if gene not in {"genome", "NA", "N/A", "NONE", "NULL"}:
+                            gene_hll.add(gene)
+
+                    if seq and _looks_like_dna_seq_list(seq):
+                        n_seq_entries += 1
+                        total_seq_chars += len(seq)
+                        seq_hll.add(seq)
+        except OSError:
+            continue
+
+    unique_seq_est = seq_hll.count()
+    unique_node_est = node_hll.count()
+    unique_gene_est = gene_hll.count()
+    avg_seq_len = (float(total_seq_chars) / float(n_seq_entries)) if n_seq_entries else 0.0
+
+    return _estimate_cdna_sequence_h5ad_memory_from_counts(
+        n_records=n_records,
+        n_seq_entries=n_seq_entries,
+        unique_seq_est=unique_seq_est,
+        unique_node_est=unique_node_est,
+        unique_gene_est=unique_gene_est,
+        avg_seq_len=avg_seq_len,
+        estimate_mode="streaming_hll_refinement",
+    )
+
+
+def _estimate_cdna_sequence_h5ad_memory_bounds(
+    assign_paths: list[tuple[int, str]],
+    max_sequence_len: int | None = None,
+) -> tuple[dict, dict] | None:
+    n_lines = _count_assignment_lines(assign_paths)
+    if n_lines is None:
+        return None
+
+    max_sequence_len = _sequence_guard_max_len(max_sequence_len)
+    lower = _estimate_cdna_sequence_h5ad_memory_from_counts(
+        n_records=n_lines,
+        n_seq_entries=n_lines,
+        unique_seq_est=1,
+        unique_node_est=1,
+        unique_gene_est=0,
+        avg_seq_len=max_sequence_len,
+        estimate_mode="wc_line_lower_bound",
+    )
+    upper = _estimate_cdna_sequence_h5ad_memory_from_counts(
+        n_records=n_lines,
+        n_seq_entries=n_lines,
+        unique_seq_est=n_lines,
+        unique_node_est=n_lines,
+        unique_gene_est=n_lines,
+        avg_seq_len=max_sequence_len,
+        estimate_mode="wc_line_upper_bound",
+    )
+    return lower, upper
+
+
+def _cdna_sequence_guard_detail(stats: dict, usable_bytes: int, resource_bytes: int, reserve_fraction: float) -> str:
+    return (
+        "mode="
+        + str(stats.get("estimate_mode", "unknown"))
+        + ", estimated_total="
+        + _format_bytes(int(stats["estimated_total_bytes"]))
+        + ", usable="
+        + _format_bytes(usable_bytes)
+        + ", resource="
+        + _format_bytes(resource_bytes)
+        + f", reserve_fraction={reserve_fraction:.2f}"
+        + ", seq_entries="
+        + f"{int(stats['n_seq_entries']):,}"
+        + ", unique_sequences_est="
+        + f"{int(stats['unique_seq_est']):,}"
+        + ", umi_rows_est="
+        + f"{int(stats['unique_node_est']):,}"
+        + ", avg_seq_len="
+        + f"{float(stats['avg_seq_len']):.1f}"
+        + ", safety_factor="
+        + f"{float(stats['safety_factor']):.2f}"
+    )
+
+
+def _cdna_sequence_features_fit_memory(
+    assign_paths: list[tuple[int, str]],
+    max_sequence_len: int | None = None,
+) -> bool:
+    if _env_flag("XVDM_DISABLE_CDNA_H5AD_SEQUENCE_MEMORY_GUARD"):
+        sysOps.throw_status(
+            "WARNING: cdna_only.h5ad sequence memory guard disabled by "
+            "XVDM_DISABLE_CDNA_H5AD_SEQUENCE_MEMORY_GUARD."
+        )
+        return True
+
+    resource_bytes = _effective_memory_resource_bytes()
+    if resource_bytes is None:
+        sysOps.throw_status(
+            "WARNING: cdna_only.h5ad sequence-feature memory resources could not be "
+            "determined; leaving automatic sequence inclusion enabled."
+        )
+        return True
+
+    reserve_fraction = _float_env("XVDM_CDNA_H5AD_MEMORY_RESERVE_FRACTION", 0.25)
+    reserve_fraction = min(max(reserve_fraction, 0.0), 0.90)
+    usable_bytes = int(max(1, resource_bytes * (1.0 - reserve_fraction)))
+
+    bounds = _estimate_cdna_sequence_h5ad_memory_bounds(assign_paths, max_sequence_len=max_sequence_len)
+    if bounds is not None:
+        lower, upper = bounds
+        if int(upper["estimated_total_bytes"]) <= usable_bytes:
+            sysOps.throw_status(
+                "cdna_only.h5ad automatic sequence features passed cheap memory guard ("
+                + _cdna_sequence_guard_detail(upper, usable_bytes, resource_bytes, reserve_fraction)
+                + ")."
+            )
+            return True
+
+        if int(lower["estimated_total_bytes"]) > usable_bytes:
+            sysOps.throw_status(
+                "WARNING: disabling raw sequence features in cdna_only.h5ad because "
+                "even the cheap lower-bound memory estimate exceeds available resources ("
+                + _cdna_sequence_guard_detail(lower, usable_bytes, resource_bytes, reserve_fraction)
+                + "). Gene/contig features will still be written; pass include_sequences=True "
+                "or set XVDM_DISABLE_CDNA_H5AD_SEQUENCE_MEMORY_GUARD=1 to force sequence features."
+            )
+            return False
+
+        sysOps.throw_status(
+            "cdna_only.h5ad cheap sequence-feature memory bound was inconclusive; "
+            "refining with a streaming unique-sequence estimate ("
+            + _cdna_sequence_guard_detail(upper, usable_bytes, resource_bytes, reserve_fraction)
+            + ")."
+        )
+
+    stats = _estimate_cdna_sequence_h5ad_memory_streaming(assign_paths)
+    detail = _cdna_sequence_guard_detail(stats, usable_bytes, resource_bytes, reserve_fraction)
+    estimated_bytes = int(stats["estimated_total_bytes"])
+
+    if estimated_bytes > usable_bytes:
+        sysOps.throw_status(
+            "WARNING: disabling raw sequence features in cdna_only.h5ad because "
+            "the estimated memory footprint exceeds available resources (" + detail + "). "
+            "Gene/contig features will still be written; pass include_sequences=True "
+            "or set XVDM_DISABLE_CDNA_H5AD_SEQUENCE_MEMORY_GUARD=1 to force sequence features."
+        )
+        return False
+
+    sysOps.throw_status(
+        "cdna_only.h5ad automatic sequence features passed memory guard (" + detail + ")."
+    )
+    return True
 
 
 def build_umi_gene_anndata(
@@ -563,6 +1025,7 @@ def build_cdna_umi_gene_anndata(
     include_nonunique_genes: bool = False,
     include_obs_strings: bool = False,
     probe_lines: int = 2000,
+    sequence_memory_guard_max_seq_len: int | None = None,
 ):
     """Build a UMI-vs-gene AnnData directly from cDNA sorted_umi_seq_assignments*.txt.
 
@@ -573,7 +1036,10 @@ def build_cdna_umi_gene_anndata(
       - No UEI linkage exists here, so `total_uei_reads` is not created.
       - `include_sequences=None` enables an *auto* mode:
             include sequences iff sequences are present AND STAR alignment does NOT appear
-            to have been performed (to avoid memory blowups in STAR-aligned runs).
+            to have been performed AND the estimated h5ad build footprint fits
+            available memory.
+            The memory guard first uses a cheap line-count bound and only streams
+            assignment records when that bound is inconclusive.
     """
     # Local helper functions (kept parallel to build_umi_gene_anndata for consistent semantics)
     PLACEHOLDERS = {"NA", "N/A", "NONE", "NULL"}
@@ -670,6 +1136,7 @@ def build_cdna_umi_gene_anndata(
                 break
 
         has_seq_col = False
+        probe_max_seq_len = 0
         n_seen = 0
         for _amp, ap in assign_paths:
             try:
@@ -695,6 +1162,7 @@ def build_cdna_umi_gene_anndata(
                             seq_candidate = rest[comma + 1 :].strip()
                             if _looks_like_dna_seq_list(seq_candidate):
                                 has_seq_col = True
+                                probe_max_seq_len = max(probe_max_seq_len, len(seq_candidate))
 
                         n_seen += 1
                         if (star_performed and has_seq_col) or (n_seen >= probe_lines):
@@ -706,6 +1174,14 @@ def build_cdna_umi_gene_anndata(
                 break
 
         include_sequences_effective = (not star_performed) and has_seq_col
+        if include_sequences_effective:
+            guard_max_len = sequence_memory_guard_max_seq_len
+            if guard_max_len is None and probe_max_seq_len > 0:
+                guard_max_len = max(probe_max_seq_len, _sequence_guard_max_len(None))
+            include_sequences_effective = _cdna_sequence_features_fit_memory(
+                assign_paths,
+                max_sequence_len=guard_max_len,
+            )
 
     # --- First pass: build mapping from (umi_type, raw_index) -> row
     type_raw_to_row = {}

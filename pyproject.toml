@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xvdm"
+version = "0.1.0"
+description = "Baseline xVDM analysis pipeline scaffold"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "annoy",
+  "anndata",
+  "faiss-cpu",
+  "joblib",
+  "numba",
+  "numpy",
+  "pandas",
+  "pymetis",
+  "scanpy",
+  "scikit-learn",
+  "scipy",
+  "threadpoolctl",
+]
+
+[project.optional-dependencies]
+clustering = [
+  "hdbscan",
+  "igraph",
+  "leidenalg",
+]
+registration = [
+  "ortools",
+]
+dev = [
+  "pytest",
+  "ruff",
+]
+all = [
+  "hdbscan",
+  "igraph",
+  "leidenalg",
+  "ortools",
+  "pytest",
+  "ruff",
+]
+
+[tool.setuptools]
+py-modules = [
+  "annotation",
+  "clusterplot",
+  "dnamicOps",
+  "hashAlignments",
+  "libOps",
+  "main",
+  "masterProcesses",
+  "optimOps",
+  "register_zf",
+  "sysOps",
+  "threads_bootstrap",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -1,0 +1,18 @@
+annoy
+anndata
+faiss-cpu
+joblib
+numba
+numpy
+pandas
+pymetis
+scanpy
+scikit-learn
+scipy
+threadpoolctl
+
+# Optional but used by specific pipeline routes:
+hdbscan
+igraph
+leidenalg
+ortools

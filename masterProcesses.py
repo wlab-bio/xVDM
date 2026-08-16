@@ -69,7 +69,7 @@ class masterProcess:
                             include_nonunique_genes=False,
                         )
                         if hasattr(adata, "write_h5ad"):
-                            adata.write_h5ad(cdna_h5ad_path)
+                            optimOps._write_h5ad_atomic(adata, cdna_h5ad_path)
                             sysOps.throw_status("Wrote cDNA-only AnnData to " + cdna_h5ad_path)
             except Exception as e:
                 sysOps.throw_status(f"Skipped cdna_only.h5ad build ({type(e).__name__}: {e})")

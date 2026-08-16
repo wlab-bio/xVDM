@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Python build and packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Pipeline outputs and temporary files
+statuslog.csv
+tmp/
+sim_fastq/
+sample/test_directory/reconstruction.png
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.sam
+*.bam
+*.npz
+*.npy
+*.h5ad
+GSEoutput*.txt
+cluster_labels*.npy
+rejected.txt.gz
+STARalignment*/
+uei_grp*/
+
+# macOS / editor noise
+.DS_Store
+.idea/
+.vscode/

@@ -152,6 +152,32 @@ def get_gene_stats(filenames):
     return [str(sum(weight >= min_umi for weight in element_weights.values())) for min_umi in [1, 5, 10]]
 
 
+def append_stats_line_once(stats_path, metric_name, value):
+    if not os.path.isfile(stats_path):
+        return False
+
+    prefix = f"{metric_name}:"
+    with open(stats_path) as stats_file:
+        for line in stats_file:
+            if line.startswith(prefix):
+                return False
+
+    with open(stats_path, "a") as stats_file:
+        stats_file.write(f"{prefix}{value}\n")
+    return True
+
+
+def count_file_lines(path):
+    if not os.path.isfile(path):
+        return None
+
+    count = 0
+    with open(path) as input_file:
+        for count, _ in enumerate(input_file, start=1):
+            pass
+    return count
+
+
 
 def escape_awk_var_for_shell(s_val):
     """Quotes a value to be passed via awk -v var=value for shell safety."""
@@ -914,7 +940,7 @@ def get_amp_consensus(seq_terminate_list,
         # End of top-level file existence check for amp_ind loop
         # End of for amp_ind loop
 
-        # --- Write amp: stats from existing seqcons_trimmed files if missing ---
+        # --- Write amp/sub-consensus stats from existing outputs if missing ---
         stats_file_to_check = gd + "pairing_stats.txt" if sysOps.check_file_exists("pairing_stats.txt") else gd + "umi_stats.txt"
         if os.path.isfile(stats_file_to_check):
             existing_amp_prefixes = set()
@@ -940,6 +966,16 @@ def get_amp_consensus(seq_terminate_list,
                         elif _tot >= 3: counts[2] += 1
                 with open(stats_file_to_check, 'a') as _sf:
                     _sf.write(f"{amp_ind}amp:{counts[0]},{counts[1]},{counts[2]}\n")
+
+            for amp_ind in range(2):
+                assignment_count = count_file_lines(gd + f"sorted_umi_seq_assignments{amp_ind}.txt")
+                if assignment_count is None:
+                    continue
+                append_stats_line_once(
+                    stats_file_to_check,
+                    f"{amp_ind}mapped_insert_subconsensus",
+                    assignment_count,
+                )
 
 
         # --- STAGE 4: Calculate Gene Statistics (whenever the pair exists, STAR or STAR-less) ---
@@ -1667,4 +1703,3 @@ def sl_clust_assoc(out_file, filter_if_umis_labeled = False, top_grps = 10, min_
 
     
     return
-
